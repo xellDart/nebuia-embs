@@ -203,13 +203,19 @@ pub async fn search_document(
         }
         Ok(result)
     } else {
-        // Top-k by score
+        // Top-k by score, then sort consecutive runs by page number.
+        // Example: scores give [p26, p25, p52, p7] → detect 26,25 are consecutive
+        // → reorder to [p25, p26, p52, p7] so the reader gets natural page order.
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let result: Vec<String> = indexed
+        let top: Vec<(i32, String)> = indexed
             .iter()
             .take(k)
-            .filter_map(|(idx, _)| pages.get(*idx).map(|p| p.image_path.clone()))
+            .filter_map(|(idx, _)| {
+                pages.get(*idx).map(|p| (p.page_number, p.image_path.clone()))
+            })
             .collect();
+
+        let result = sort_consecutive_runs(top);
         Ok(result)
     }
 }
@@ -242,6 +248,40 @@ pub async fn delete_document(
         "deleted_pages": num_pages,
         "deleted_embeddings": true
     }))
+}
+
+/// Sort consecutive page runs by page number while preserving group rank.
+/// Input ranked by score: [(p26,".."), (p25,".."), (p52,".."), (p7,"..")]
+/// Output: [(p25,".."), (p26,".."), (p52,".."), (p7,"..")]
+/// Only adjacent entries whose page numbers differ by exactly 1 are grouped.
+fn sort_consecutive_runs(ranked: Vec<(i32, String)>) -> Vec<String> {
+    if ranked.is_empty() {
+        return Vec::new();
+    }
+
+    // Group adjacent entries that are consecutive (differ by ±1)
+    let mut groups: Vec<Vec<(i32, String)>> = Vec::new();
+    let mut current_group = vec![ranked[0].clone()];
+
+    for pair in ranked.iter().skip(1) {
+        let prev_page = current_group.last().unwrap().0;
+        if (pair.0 - prev_page).abs() == 1 {
+            current_group.push(pair.clone());
+        } else {
+            groups.push(current_group);
+            current_group = vec![pair.clone()];
+        }
+    }
+    groups.push(current_group);
+
+    // Sort each group by page number (ascending), then flatten
+    groups
+        .iter_mut()
+        .flat_map(|g| {
+            g.sort_by_key(|(page, _)| *page);
+            g.iter().map(|(_, path)| path.clone())
+        })
+        .collect()
 }
 
 /// Download a batch of images in parallel (4 concurrent).
