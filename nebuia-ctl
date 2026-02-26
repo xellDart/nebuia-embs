@@ -1,0 +1,365 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ─────────────────────────────────────────────────────────────────────
+# nebuia-ctl — Service management CLI for nebuia-embs
+# ─────────────────────────────────────────────────────────────────────
+
+# Find project root (where this script lives)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN="$SCRIPT_DIR/target/release/nebuia-embs"
+PID_FILE="$SCRIPT_DIR/nebuia-embs.pid"
+LOG_FILE="$SCRIPT_DIR/nebuia-embs.log"
+ENV_FILE="$SCRIPT_DIR/.env"
+
+# ── Colors ──
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# ── Helpers ──
+get_pid() {
+  if [ -f "$PID_FILE" ]; then
+    local pid
+    pid=$(cat "$PID_FILE" 2>/dev/null)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      echo "$pid"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+get_port() {
+  if [ -f "$ENV_FILE" ]; then
+    grep -E '^PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]'
+  fi
+}
+
+format_bytes() {
+  local bytes=$1
+  if [ "$bytes" -ge 1073741824 ]; then
+    echo "$(awk "BEGIN {printf \"%.1f\", $bytes/1073741824}") GB"
+  elif [ "$bytes" -ge 1048576 ]; then
+    echo "$(awk "BEGIN {printf \"%.1f\", $bytes/1048576}") MB"
+  elif [ "$bytes" -ge 1024 ]; then
+    echo "$(awk "BEGIN {printf \"%.1f\", $bytes/1024}") KB"
+  else
+    echo "$bytes B"
+  fi
+}
+
+format_uptime() {
+  local secs=$1
+  if [ "$secs" -ge 86400 ]; then
+    printf "%dd %dh %dm" $((secs/86400)) $((secs%86400/3600)) $((secs%3600/60))
+  elif [ "$secs" -ge 3600 ]; then
+    printf "%dh %dm %ds" $((secs/3600)) $((secs%3600/60)) $((secs%60))
+  elif [ "$secs" -ge 60 ]; then
+    printf "%dm %ds" $((secs/60)) $((secs%60))
+  else
+    printf "%ds" "$secs"
+  fi
+}
+
+banner() {
+  echo ""
+  echo -e "  ${CYAN}${BOLD}nebuia-embs${RESET} ${DIM}v$(grep '^version' "$SCRIPT_DIR/Cargo.toml" 2>/dev/null | head -1 | sed 's/.*"\(.*\)".*/\1/')${RESET}"
+  echo ""
+}
+
+# ═════════════════════════════════════════════════════════════════════
+#  Commands
+# ═════════════════════════════════════════════════════════════════════
+
+cmd_start() {
+  banner
+  local port
+  port=$(get_port)
+  port=${port:-8000}
+
+  if pid=$(get_pid); then
+    echo -e "  ${YELLOW}Service already running (PID $pid)${RESET}"
+    echo -e "  ${DIM}Use 'nebuia-ctl restart' to restart${RESET}"
+    return 1
+  fi
+
+  if [ ! -f "$BIN" ]; then
+    echo -e "  ${RED}Binary not found: $BIN${RESET}"
+    echo -e "  ${DIM}Run: cd $SCRIPT_DIR && cargo build --release --features cuda${RESET}"
+    return 1
+  fi
+
+  echo -e "  ${BLUE}Starting nebuia-embs...${RESET}"
+
+  local env_flag=""
+  [ -f "$ENV_FILE" ] && env_flag="--env-file $ENV_FILE"
+
+  # shellcheck disable=SC2086
+  RUST_LOG=info nohup "$BIN" $env_flag > "$LOG_FILE" 2>&1 &
+  local new_pid=$!
+  echo "$new_pid" > "$PID_FILE"
+
+  # Wait for model to load and server to be ready
+  echo -ne "  ${DIM}Waiting for model to load"
+  local waited=0
+  while [ $waited -lt 60 ]; do
+    if ! kill -0 "$new_pid" 2>/dev/null; then
+      echo -e "${RESET}"
+      echo -e "  ${RED}Service failed to start. Check logs:${RESET}"
+      echo -e "  ${DIM}tail -20 $LOG_FILE${RESET}"
+      return 1
+    fi
+    if curl -sf "http://localhost:$port/health" >/dev/null 2>&1; then
+      echo -e "${RESET}"
+      echo ""
+      echo -e "  ${GREEN}${BOLD}Service started${RESET}"
+      echo ""
+      echo -e "  ${DIM}PID${RESET}     $new_pid"
+      echo -e "  ${DIM}Port${RESET}    $port"
+      echo -e "  ${DIM}Logs${RESET}    $LOG_FILE"
+      echo -e "  ${DIM}URL${RESET}     http://localhost:$port"
+      echo ""
+      return 0
+    fi
+    echo -n "."
+    sleep 2
+    waited=$((waited + 2))
+  done
+
+  echo -e "${RESET}"
+  if kill -0 "$new_pid" 2>/dev/null; then
+    echo -e "  ${YELLOW}Service started but health check not responding yet (PID $new_pid)${RESET}"
+    echo -e "  ${DIM}Model may still be loading. Check: nebuia-ctl status${RESET}"
+  else
+    echo -e "  ${RED}Service failed to start${RESET}"
+    echo -e "  ${DIM}tail -20 $LOG_FILE${RESET}"
+  fi
+}
+
+cmd_stop() {
+  banner
+  if pid=$(get_pid); then
+    echo -e "  ${BLUE}Stopping nebuia-embs (PID $pid)...${RESET}"
+    kill "$pid" 2>/dev/null || true
+    sleep 2
+
+    if kill -0 "$pid" 2>/dev/null; then
+      echo -e "  ${YELLOW}Sending SIGKILL...${RESET}"
+      kill -9 "$pid" 2>/dev/null || true
+      sleep 1
+    fi
+
+    rm -f "$PID_FILE"
+    echo -e "  ${GREEN}Service stopped${RESET}"
+  else
+    echo -e "  ${DIM}Service is not running${RESET}"
+    rm -f "$PID_FILE"
+  fi
+  echo ""
+}
+
+cmd_restart() {
+  cmd_stop
+  sleep 1
+  cmd_start
+}
+
+cmd_status() {
+  banner
+
+  local port
+  port=$(get_port)
+  port=${port:-8000}
+
+  if pid=$(get_pid); then
+    # Process info
+    local rss_kb vsize_kb threads start_time uptime_secs now_epoch start_epoch
+    rss_kb=$(awk '/VmRSS/ {print $2}' /proc/"$pid"/status 2>/dev/null || echo "0")
+    vsize_kb=$(awk '/VmSize/ {print $2}' /proc/"$pid"/status 2>/dev/null || echo "0")
+    threads=$(awk '/Threads/ {print $2}' /proc/"$pid"/status 2>/dev/null || echo "0")
+
+    start_epoch=$(stat -c %Y /proc/"$pid" 2>/dev/null || echo "0")
+    now_epoch=$(date +%s)
+    uptime_secs=$((now_epoch - start_epoch))
+
+    # GPU memory (if nvidia-smi available)
+    local gpu_mem=""
+    if command -v nvidia-smi &>/dev/null; then
+      gpu_mem=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null | \
+        grep "^$pid" | awk -F', ' '{print $2}' | head -1)
+    fi
+
+    echo -e "  ${GREEN}${BOLD}Service running${RESET}"
+    echo ""
+    echo -e "  ${DIM}PID${RESET}        $pid"
+    echo -e "  ${DIM}Port${RESET}       $port"
+    echo -e "  ${DIM}Uptime${RESET}     $(format_uptime $uptime_secs)"
+    echo -e "  ${DIM}RAM${RESET}        $(format_bytes $((rss_kb * 1024)))"
+    echo -e "  ${DIM}VIRT${RESET}       $(format_bytes $((vsize_kb * 1024)))"
+    echo -e "  ${DIM}Threads${RESET}    $threads"
+    if [ -n "$gpu_mem" ] && [ "$gpu_mem" != "0" ]; then
+      echo -e "  ${DIM}GPU mem${RESET}    ${gpu_mem} MiB"
+    fi
+    echo -e "  ${DIM}Log${RESET}        $LOG_FILE"
+
+    # Health check
+    echo ""
+    if health=$(curl -sf "http://localhost:$port/health" 2>/dev/null); then
+      local db_ok minio_ok model_ok
+      db_ok=$(echo "$health" | python3 -c "import sys,json; print(json.load(sys.stdin)['services']['database']['healthy'])" 2>/dev/null || echo "?")
+      minio_ok=$(echo "$health" | python3 -c "import sys,json; print(json.load(sys.stdin)['services']['minio']['healthy'])" 2>/dev/null || echo "?")
+      model_ok=$(echo "$health" | python3 -c "import sys,json; print(json.load(sys.stdin)['services']['model']['healthy'])" 2>/dev/null || echo "?")
+
+      printf "  %-12s" "Services"
+      [ "$db_ok" = "True" ]    && echo -ne "${GREEN}DB${RESET}  "    || echo -ne "${RED}DB${RESET}  "
+      [ "$minio_ok" = "True" ] && echo -ne "${GREEN}MinIO${RESET}  " || echo -ne "${RED}MinIO${RESET}  "
+      [ "$model_ok" = "True" ] && echo -ne "${GREEN}Model${RESET}"   || echo -ne "${RED}Model${RESET}"
+      echo ""
+    else
+      echo -e "  ${DIM}Services${RESET}   ${YELLOW}health check failed${RESET}"
+    fi
+  else
+    echo -e "  ${RED}${BOLD}Service stopped${RESET}"
+    echo ""
+    echo -e "  ${DIM}Start with: nebuia-ctl start${RESET}"
+  fi
+  echo ""
+}
+
+cmd_log() {
+  if [ ! -f "$LOG_FILE" ]; then
+    echo "No log file found at $LOG_FILE"
+    return 1
+  fi
+  local lines="${1:-50}"
+  tail -f -n "$lines" "$LOG_FILE"
+}
+
+cmd_health() {
+  local port
+  port=$(get_port)
+  port=${port:-8000}
+
+  if health=$(curl -sf "http://localhost:$port/health" 2>/dev/null); then
+    echo "$health" | python3 -m json.tool 2>/dev/null || echo "$health"
+  else
+    echo -e "${RED}Service unreachable at http://localhost:$port${RESET}"
+    return 1
+  fi
+}
+
+cmd_search() {
+  local doc_id="${1:-}"
+  local query="${2:-}"
+  local k="${3:-3}"
+
+  if [ -z "$doc_id" ] || [ -z "$query" ]; then
+    echo "Usage: nebuia-ctl search <document_id> <query> [k]"
+    return 1
+  fi
+
+  local port
+  port=$(get_port)
+  port=${port:-8000}
+
+  local encoded_query
+  encoded_query=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$query'))" 2>/dev/null || echo "$query")
+
+  echo -e "${DIM}GET /simple/search/$doc_id?query=$query&k=$k${RESET}"
+  echo ""
+
+  local start_ms end_ms elapsed_ms
+  start_ms=$(date +%s%N)
+  result=$(curl -sf "http://localhost:$port/simple/search/$doc_id?query=$encoded_query&k=$k" 2>/dev/null)
+  end_ms=$(date +%s%N)
+  elapsed_ms=$(( (end_ms - start_ms) / 1000000 ))
+
+  if [ -n "$result" ]; then
+    echo "$result" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for i, path in enumerate(data, 1):
+    page = path.split('_page_')[1].split('.')[0] if '_page_' in path else '?'
+    print(f'  {i}. page {page}  \033[2m{path}\033[0m')
+" 2>/dev/null || echo "$result"
+    echo ""
+    echo -e "  ${DIM}${elapsed_ms}ms${RESET}"
+  else
+    echo -e "${RED}Search failed${RESET}"
+    return 1
+  fi
+}
+
+cmd_process() {
+  local doc_id="${1:-}"
+
+  if [ -z "$doc_id" ]; then
+    echo "Usage: nebuia-ctl process <document_id>"
+    return 1
+  fi
+
+  local port
+  port=$(get_port)
+  port=${port:-8000}
+
+  echo -e "${DIM}POST /process-pdf${RESET}"
+  echo ""
+  curl -sf -X POST "http://localhost:$port/process-pdf" \
+    -H "Content-Type: application/json" \
+    -d "{\"document_id\": \"$doc_id\"}" 2>/dev/null | python3 -m json.tool 2>/dev/null
+  echo ""
+}
+
+# ═════════════════════════════════════════════════════════════════════
+#  Main
+# ═════════════════════════════════════════════════════════════════════
+
+CMD="${1:-help}"
+shift 2>/dev/null || true
+
+case "$CMD" in
+  start)   cmd_start ;;
+  stop)    cmd_stop ;;
+  restart) cmd_restart ;;
+  status)  cmd_status ;;
+  log)     cmd_log "$@" ;;
+  health)  cmd_health ;;
+  search)  cmd_search "$@" ;;
+  process) cmd_process "$@" ;;
+  help|-h|--help)
+    echo ""
+    echo -e "  ${BOLD}${CYAN}nebuia-ctl${RESET} — manage nebuia-embs service"
+    echo ""
+    echo -e "  ${BOLD}Usage:${RESET} nebuia-ctl <command> [args]"
+    echo ""
+    echo -e "  ${BOLD}Commands:${RESET}"
+    echo "    start              Start service as daemon"
+    echo "    stop               Stop running service"
+    echo "    restart            Restart service"
+    echo "    status             Show PID, memory, uptime, health"
+    echo "    log [n]            Tail logs (default: last 50 lines)"
+    echo "    health             Quick health check (JSON)"
+    echo "    search <id> <q>    Search document pages"
+    echo "    process <id>       Trigger embedding processing"
+    echo "    help               Show this help"
+    echo ""
+    echo -e "  ${BOLD}Examples:${RESET}"
+    echo "    nebuia-ctl start"
+    echo "    nebuia-ctl status"
+    echo "    nebuia-ctl search abc-123 \"tabla de accionistas\""
+    echo "    nebuia-ctl process def-456"
+    echo "    nebuia-ctl log 100"
+    echo ""
+    ;;
+  *)
+    echo "Unknown command: $CMD"
+    echo "Run 'nebuia-ctl help' for usage"
+    exit 1
+    ;;
+esac

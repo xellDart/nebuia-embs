@@ -1,0 +1,21 @@
+# Build
+/target/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Runtime
+*.log
+*.pid
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
