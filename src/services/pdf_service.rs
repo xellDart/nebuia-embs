@@ -1,4 +1,5 @@
 use anyhow::Result;
+use futures_util::stream::{self, StreamExt};
 use tracing::{error, info, warn};
 
 use crate::repositories::{document_repository, storage_repository::StorageRepository};
@@ -70,10 +71,19 @@ async fn do_process(
         document_id
     );
 
-    // Download and process in batches
+    // Download and process in batches (parallel downloads, no temp files)
     let mut all_embeddings: Vec<PageEmbedding> = Vec::new();
+    let chunks: Vec<&[String]> = page_objects.chunks(batch_size).collect();
 
-    for (batch_idx, chunk) in page_objects.chunks(batch_size).enumerate() {
+    // Pre-fetch first batch
+    let mut next_download: Option<tokio::task::JoinHandle<Result<Vec<Vec<u8>>>>> = None;
+    if let Some(first_chunk) = chunks.first() {
+        let chunk_names: Vec<String> = first_chunk.to_vec();
+        let st = storage.clone();
+        next_download = Some(tokio::spawn(download_batch(st, chunk_names)));
+    }
+
+    for (batch_idx, chunk) in chunks.iter().enumerate() {
         info!(
             "Processing batch {} ({} images) for {}",
             batch_idx + 1,
@@ -81,27 +91,22 @@ async fn do_process(
             document_id
         );
 
-        // Download images and save to temp files
-        let mut temp_paths = Vec::new();
-        for object_name in chunk {
-            let image_bytes = storage.get_image(object_name).await?;
-            let tmp = std::env::temp_dir().join(format!(
-                "nebuia_{}_{}.jpg",
-                document_id,
-                extract_page_number(object_name)
-            ));
-            std::fs::write(&tmp, &image_bytes)?;
-            temp_paths.push(tmp);
+        // Await current batch download
+        let images_bytes = next_download
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("No download task"))?
+            .await??;
+
+        // Pre-fetch next batch while encoding
+        if batch_idx + 1 < chunks.len() {
+            let chunk_names: Vec<String> = chunks[batch_idx + 1].to_vec();
+            let st = storage.clone();
+            next_download = Some(tokio::spawn(download_batch(st, chunk_names)));
         }
 
-        // Encode batch
-        let batch_embeddings = embedding.encode_images(temp_paths.clone()).await?;
+        // Encode from bytes (no temp files)
+        let batch_embeddings = embedding.encode_images_from_bytes(images_bytes).await?;
         all_embeddings.extend(batch_embeddings);
-
-        // Cleanup temp files
-        for tmp in &temp_paths {
-            let _ = std::fs::remove_file(tmp);
-        }
     }
 
     // Verify document still exists
@@ -116,11 +121,10 @@ async fn do_process(
         return Ok(());
     }
 
-    // Save page metadata to DB
-    for object_name in page_objects.iter() {
-        let page_number = extract_page_number(object_name);
-        document_repository::save_page(pool, document_id, page_number, object_name).await?;
-    }
+    // Save page metadata to DB (batch insert)
+    let page_numbers: Vec<i32> = page_objects.iter().map(|n| extract_page_number(n)).collect();
+    let image_paths: Vec<&str> = page_objects.iter().map(|s| s.as_str()).collect();
+    document_repository::save_pages_batch(pool, document_id, &page_numbers, &image_paths).await?;
 
     // Serialize and upload embeddings (bf16 format)
     let raw = serialize_embeddings(&all_embeddings);
@@ -221,27 +225,36 @@ pub async fn delete_document(
         .await?
         .ok_or_else(|| anyhow::anyhow!("Document {} not found", document_id))?;
 
-    let image_paths: Vec<String> = pages.iter().map(|p| p.image_path.clone()).collect();
-    let num_images = image_paths.len();
+    let num_pages = pages.len();
 
-    // Delete from storage
-    if !image_paths.is_empty() {
-        storage.delete_objects(&image_paths).await?;
-    }
+    // Delete only embeddings from storage (images belong to the upload service)
     let emb_key = format!("{}_embeddings.zst", document_id);
     storage.delete_objects(&[emb_key]).await?;
 
     // Clear cache
     cache.remove(document_id).await;
 
-    // Delete from DB
+    // Delete from DB (pages cascade-delete via FK)
     document_repository::delete_document(pool, document_id).await?;
 
     Ok(serde_json::json!({
-        "message": format!("Document {} completely deleted", document_id),
-        "deleted_images": num_images,
+        "message": format!("Document {} deleted", document_id),
+        "deleted_pages": num_pages,
         "deleted_embeddings": true
     }))
+}
+
+/// Download a batch of images in parallel (4 concurrent).
+async fn download_batch(storage: StorageRepository, names: Vec<String>) -> Result<Vec<Vec<u8>>> {
+    let results: Vec<Result<Vec<u8>>> = stream::iter(names.into_iter().map(|name| {
+        let st = storage.clone();
+        async move { st.get_image(&name).await.map(|b| b.to_vec()) }
+    }))
+    .buffered(4)
+    .collect()
+    .await;
+
+    results.into_iter().collect()
 }
 
 fn extract_page_number(name: &str) -> i32 {

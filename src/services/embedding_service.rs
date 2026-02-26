@@ -1,6 +1,5 @@
 use anyhow::Result;
 use candle_core::Tensor;
-use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
 
@@ -14,8 +13,8 @@ pub struct PageEmbedding {
 }
 
 enum Request {
-    EncodeImages {
-        paths: Vec<PathBuf>,
+    EncodeImagesFromBytes {
+        images: Vec<Vec<u8>>,
         reply: oneshot::Sender<Result<Vec<PageEmbedding>>>,
     },
     EncodeQuery {
@@ -61,8 +60,8 @@ impl EmbeddingService {
 
                 while let Some(req) = rx.blocking_recv() {
                     match req {
-                        Request::EncodeImages { paths, reply } => {
-                            let result = encode_images(&mut model, &paths);
+                        Request::EncodeImagesFromBytes { images, reply } => {
+                            let result = encode_images_from_bytes(&mut model, &images);
                             let _ = reply.send(result);
                         }
                         Request::EncodeQuery { query, reply } => {
@@ -84,11 +83,11 @@ impl EmbeddingService {
         Ok(Self { tx })
     }
 
-    pub async fn encode_images(&self, paths: Vec<PathBuf>) -> Result<Vec<PageEmbedding>> {
+    pub async fn encode_images_from_bytes(&self, images: Vec<Vec<u8>>) -> Result<Vec<PageEmbedding>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(Request::EncodeImages {
-                paths,
+            .send(Request::EncodeImagesFromBytes {
+                images,
                 reply: reply_tx,
             })
             .map_err(|_| anyhow::anyhow!("Model thread died"))?;
@@ -147,13 +146,13 @@ fn page_embedding_to_tensor(
     Ok(t)
 }
 
-fn encode_images(
+fn encode_images_from_bytes(
     model: &mut crane_core::models::colqwen3_emb::ColQwen3Emb,
-    paths: &[PathBuf],
+    images: &[Vec<u8>],
 ) -> Result<Vec<PageEmbedding>> {
     let mut all = Vec::new();
-    for path in paths {
-        let tensors = model.encode_images(&[path])?;
+    for img_bytes in images {
+        let tensors = model.encode_images_from_bytes(&[img_bytes.as_slice()])?;
         for t in &tensors {
             all.push(tensor_to_page_embedding(t)?);
         }
@@ -188,6 +187,13 @@ fn score(
 
     let scores = crane_core::models::colqwen3_emb::ColQwen3Emb::score(&qs, &ps, 128)?;
     let scores_vec: Vec<f32> = scores.squeeze(0)?.to_vec1()?;
+
+    // Log top scores
+    let mut indexed: Vec<(usize, f32)> = scores_vec.iter().copied().enumerate().collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let top: Vec<String> = indexed.iter().take(10).map(|(i, s)| format!("p{}={:.1}", i, s)).collect();
+    info!("Scores top-10: {}", top.join(", "));
+
     Ok(scores_vec)
 }
 

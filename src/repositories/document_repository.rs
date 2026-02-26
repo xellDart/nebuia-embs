@@ -67,6 +67,61 @@ pub async fn save_page(
     Ok(())
 }
 
+pub async fn save_pages_batch(
+    pool: &PgPool,
+    document_id: &str,
+    page_numbers: &[i32],
+    image_paths: &[&str],
+) -> anyhow::Result<()> {
+    if page_numbers.is_empty() {
+        return Ok(());
+    }
+
+    // Build batch insert with typed bindings
+    // id: text, document_id: text, page_number: int4, image_path: text
+    let mut query = String::from(
+        "INSERT INTO pages (id, document_id, page_number, image_path) VALUES ",
+    );
+
+    let count = page_numbers.len();
+    // Collect typed params
+    let mut ids: Vec<String> = Vec::with_capacity(count);
+    let mut doc_ids: Vec<String> = Vec::with_capacity(count);
+
+    for i in 0..count {
+        if i > 0 {
+            query.push_str(", ");
+        }
+        let base = i * 4;
+        query.push_str(&format!(
+            "(${}, ${}, ${}, ${})",
+            base + 1,
+            base + 2,
+            base + 3,
+            base + 4
+        ));
+        ids.push(uuid::Uuid::new_v4().to_string());
+        doc_ids.push(document_id.to_string());
+    }
+
+    query.push_str(
+        " ON CONFLICT (document_id, page_number) DO UPDATE SET image_path = EXCLUDED.image_path",
+    );
+
+    // Bind with correct types: text, text, int4, text
+    let mut q = sqlx::query(&query);
+    for i in 0..count {
+        q = q
+            .bind(&ids[i])
+            .bind(&doc_ids[i])
+            .bind(page_numbers[i])
+            .bind(image_paths[i]);
+    }
+    q.execute(pool).await?;
+
+    Ok(())
+}
+
 pub async fn delete_document(pool: &PgPool, document_id: &str) -> anyhow::Result<bool> {
     // Pages cascade-delete via FK
     let result = sqlx::query("DELETE FROM documents WHERE id = $1")

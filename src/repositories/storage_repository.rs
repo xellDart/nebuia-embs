@@ -105,7 +105,7 @@ impl StorageRepository {
     ) -> Result<String> {
         let object_name = format!("{}_embeddings.zst", document_id);
 
-        let compressed = zstd::encode_all(data, 9)
+        let compressed = zstd::encode_all(data, 3)
             .context("Failed to compress embeddings")?;
 
         let original_size = data.len();
