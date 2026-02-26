@@ -9,7 +9,6 @@ set -euo pipefail
 #   curl -fsSL https://raw.githubusercontent.com/xellDart/nebuia-embs/main/install.sh | bash
 #
 # Or with options:
-#   curl -fsSL ... | bash -s -- --model-path /path/to/colqwen3 --start
 #   curl -fsSL ... | bash -s -- --cpu
 #   curl -fsSL ... | bash -s -- --dir /opt/nebuia-embs
 #
@@ -19,33 +18,19 @@ set -euo pipefail
 #   3. Auto-detects CUDA, GPU, Flash Attention
 #   4. Builds with optimal features
 #   5. Installs nebuia-ctl management CLI
-#   6. Optionally starts the service
 # ─────────────────────────────────────────────────────────────────────
 
 REPO_URL="https://github.com/xellDart/nebuia-embs.git"
 BRANCH="main"
 INSTALL_DIR=""
-MODEL_PATH=""
 FORCE_CPU=false
-START_AFTER=false
-DAEMON_MODE=false
-PORT=8000
-ENV_FILE=""
 
 for arg in "$@"; do
   case "$arg" in
-    --model-path=*) MODEL_PATH="${arg#--model-path=}" ;;
-    --model-path)   ;; # handled below
     --dir=*)        INSTALL_DIR="${arg#--dir=}" ;;
     --dir)          ;; # handled below
     --branch=*)     BRANCH="${arg#--branch=}" ;;
-    --port=*)       PORT="${arg#--port=}" ;;
-    --port)         ;; # handled below
-    --env=*)        ENV_FILE="${arg#--env=}" ;;
-    --env)          ;; # handled below
     --cpu)          FORCE_CPU=true ;;
-    --start)        START_AFTER=true ;;
-    --daemon)       START_AFTER=true; DAEMON_MODE=true ;;
     -h|--help)
       cat <<'HELP'
 nebuia-embs Installer — document embedding service powered by ColQwen3
@@ -55,36 +40,30 @@ Usage:
   curl -fsSL ... | bash -s -- [OPTIONS]
 
 Options:
-  --model-path <path>   Path to ColQwen3 model weights
   --dir <path>          Install directory (default: ./nebuia-embs)
   --branch <name>       Git branch to checkout (default: main)
-  --env <path>          Path to .env configuration file
   --cpu                 Force CPU-only build (skip CUDA detection)
-  --start               Start the service in foreground after build
-  --daemon              Start the service as a background daemon after build
-  --port <port>         Service port (default: 8000)
   -h, --help            Show this help
 
 Examples:
-  # Just build (auto-detect GPU)
+  # Auto-detect GPU and build
   curl -fsSL ... | bash
 
-  # Build + start with local model
-  curl -fsSL ... | bash -s -- --model-path /path/to/colqwen3 --start
-
-  # Build + start as daemon
-  curl -fsSL ... | bash -s -- --daemon --port 9000
+  # CPU-only build
+  curl -fsSL ... | bash -s -- --cpu
 
   # Install to custom directory
   curl -fsSL ... | bash -s -- --dir /opt/nebuia-embs
+
+After installation:
+  1. cp .env.example .env    # configure database, S3, model path
+  2. nebuia-ctl start        # start as daemon
+  3. nebuia-ctl status       # check health
 HELP
       exit 0
       ;;
     *)
-      if [ "${PREV_ARG:-}" = "--model-path" ]; then MODEL_PATH="$arg"; fi
-      if [ "${PREV_ARG:-}" = "--dir" ];        then INSTALL_DIR="$arg"; fi
-      if [ "${PREV_ARG:-}" = "--port" ];       then PORT="$arg"; fi
-      if [ "${PREV_ARG:-}" = "--env" ];        then ENV_FILE="$arg"; fi
+      if [ "${PREV_ARG:-}" = "--dir" ]; then INSTALL_DIR="$arg"; fi
       ;;
   esac
   PREV_ARG="$arg"
@@ -300,65 +279,6 @@ fi
 echo ""
 
 # ═════════════════════════════════════════════════════════════════════
-#  Step 4: Start Service (optional)
-# ═════════════════════════════════════════════════════════════════════
-
-SERVICE_STARTED=false
-LOG_FILE="$PROJECT_DIR/nebuia-embs.log"
-PID_FILE="$PROJECT_DIR/nebuia-embs.pid"
-
-ENV_FLAG=""
-if [ -n "$ENV_FILE" ]; then
-  ENV_FLAG="--env-file $ENV_FILE"
-elif [ -f "$PROJECT_DIR/.env" ]; then
-  ENV_FLAG="--env-file $PROJECT_DIR/.env"
-fi
-
-if [ "$START_AFTER" = true ]; then
-  if [ ! -f "$BIN_PATH" ]; then
-    fail "Binary not found at $BIN_PATH"
-  fi
-
-  if [ "$DAEMON_MODE" = true ]; then
-    info "Starting nebuia-embs daemon on port $PORT..."
-
-    # Kill existing daemon if running
-    if [ -f "$PID_FILE" ]; then
-      OLD_PID=$(cat "$PID_FILE" 2>/dev/null)
-      if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-        warn "Stopping existing daemon (PID $OLD_PID)..."
-        kill "$OLD_PID" 2>/dev/null || true
-        sleep 2
-      fi
-    fi
-
-    # shellcheck disable=SC2086
-    PORT="$PORT" nohup "$BIN_PATH" $ENV_FLAG > "$LOG_FILE" 2>&1 &
-
-    DAEMON_PID=$!
-    echo "$DAEMON_PID" > "$PID_FILE"
-
-    sleep 5
-    if kill -0 "$DAEMON_PID" 2>/dev/null; then
-      ok "Daemon started (PID $DAEMON_PID)"
-      ok "Logs:  tail -f $LOG_FILE"
-      ok "Stop:  nebuia-ctl stop"
-      SERVICE_STARTED=true
-    else
-      warn "Daemon may have failed to start. Check logs:"
-      echo "  tail -20 $LOG_FILE"
-    fi
-  else
-    info "Starting nebuia-embs on port $PORT (foreground)..."
-    echo ""
-    # shellcheck disable=SC2086
-    exec env PORT="$PORT" "$BIN_PATH" $ENV_FLAG
-  fi
-fi
-
-echo ""
-
-# ═════════════════════════════════════════════════════════════════════
 #  Summary
 # ═════════════════════════════════════════════════════════════════════
 
@@ -378,11 +298,18 @@ else
   echo "  CUDA:        not detected (CPU build)"
 fi
 echo "  Build time:  $(elapsed $BUILD_ELAPSED)"
-if [ -n "$MODEL_PATH" ] && [ -d "$MODEL_PATH" ]; then
-  echo "  Model:       $MODEL_PATH"
-fi
-if [ "$SERVICE_STARTED" = true ]; then
-  echo "  Service:     http://localhost:$PORT (daemon, PID $(cat "$PID_FILE"))"
+echo ""
+
+# ── Next steps ──
+echo -e "  ${BOLD}Next steps:${RESET}"
+echo ""
+if [ ! -f "$PROJECT_DIR/.env" ]; then
+  echo "    1. cp .env.example .env     # configure database, S3, model path"
+  echo "    2. nebuia-ctl start         # start as daemon"
+  echo "    3. nebuia-ctl status        # check health"
+else
+  echo "    1. nebuia-ctl start         # start as daemon"
+  echo "    2. nebuia-ctl status        # check health"
 fi
 echo ""
 
@@ -397,35 +324,6 @@ echo "    nebuia-ctl log          Tail service logs"
 echo "    nebuia-ctl health       Quick health check"
 echo "    nebuia-ctl search <id> <query>  Test search"
 echo ""
-
-# ── How to test ──
-echo -e "  ${BOLD}Test the API:${RESET}"
-echo ""
-cat << CURL_EXAMPLE
-    # Health check
-    curl http://localhost:$PORT/health
-
-    # Process a document
-    curl -X POST http://localhost:$PORT/process-pdf \\
-      -H 'Content-Type: application/json' \\
-      -d '{"document_id": "your-doc-id"}'
-
-    # Search
-    curl "http://localhost:$PORT/simple/search/your-doc-id?query=tabla&k=3"
-
-    # Delete
-    curl -X DELETE http://localhost:$PORT/document/your-doc-id
-CURL_EXAMPLE
-echo ""
-
-# ── Configuration ──
-if [ ! -f "$PROJECT_DIR/.env" ]; then
-  echo -e "  ${BOLD}Configuration:${RESET}"
-  echo ""
-  echo "    Copy .env.example to .env and set your credentials:"
-  echo "    cp $PROJECT_DIR/.env.example $PROJECT_DIR/.env"
-  echo ""
-fi
 
 echo "  Re-run installer:  curl -fsSL https://raw.githubusercontent.com/xellDart/nebuia-embs/main/install.sh | bash"
 echo "  Rebuild only:      cd $PROJECT_DIR && cargo build --release --features cuda"

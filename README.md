@@ -61,14 +61,18 @@ curl -fsSL https://raw.githubusercontent.com/xellDart/nebuia-embs/main/install.s
 
 With options:
 ```bash
-# Build + start as daemon
-curl -fsSL ... | bash -s -- --model-path /path/to/Ops-Colqwen3-4B --daemon
-
 # CPU-only build
 curl -fsSL ... | bash -s -- --cpu
 
-# Custom directory + port
-curl -fsSL ... | bash -s -- --dir /opt/nebuia-embs --port 9000
+# Custom install directory
+curl -fsSL ... | bash -s -- --dir /opt/nebuia-embs
+```
+
+After install:
+```bash
+cp .env.example .env       # configure database, S3, model path
+nebuia-ctl start           # start as daemon
+nebuia-ctl status          # check health
 ```
 
 ### Manual build
