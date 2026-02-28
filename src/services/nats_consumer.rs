@@ -9,7 +9,29 @@ pub async fn run_nats_consumer(state: Arc<AppState>) -> Result<()> {
     let nats_url = &state.config.nats_url;
     info!("Connecting to NATS at {}...", nats_url);
 
-    let client = async_nats::connect(nats_url).await?;
+    // Parse credentials from URL: nats://user:pass@host:port → ConnectOptions
+    let client = if nats_url.contains('@') {
+        let without_scheme = nats_url
+            .strip_prefix("nats://")
+            .unwrap_or(nats_url);
+        let (creds, host) = without_scheme
+            .split_once('@')
+            .unwrap_or(("", without_scheme));
+        let (user, pass) = creds
+            .split_once(':')
+            .unwrap_or((creds, ""));
+        info!("NATS authenticating as user '{}'", user);
+        async_nats::ConnectOptions::new()
+            .user_and_password(user.to_string(), pass.to_string())
+            .connect(host)
+            .await?
+    } else {
+        let host = nats_url
+            .strip_prefix("nats://")
+            .unwrap_or(nats_url);
+        async_nats::connect(host).await?
+    };
+
     let jetstream = async_nats::jetstream::new(client.clone());
 
     info!("NATS connected, creating pull consumer...");
