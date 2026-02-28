@@ -135,6 +135,9 @@ Type=simple
 ExecStart=$exec_start
 WorkingDirectory=$SCRIPT_DIR
 Environment=RUST_LOG=info
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=$SERVICE_NAME
 Restart=on-failure
 RestartSec=5
 User=$(whoami)
