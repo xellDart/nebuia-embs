@@ -15,12 +15,15 @@ set -euo pipefail
 # What it does:
 #   1. Installs Rust (if not found)
 #   2. Clones nebuia-embs (or updates if already present)
-#   3. Auto-detects CUDA, GPU, Flash Attention
-#   4. Builds with optimal features
-#   5. Installs nebuia-ctl management CLI
+#   3. Clones Crane dependency (ColQwen3 embeddings engine)
+#   4. Auto-detects CUDA, GPU, Flash Attention
+#   5. Builds with optimal features (flash-attn on SM_80+ GPUs)
+#   6. Installs nebuia-ctl management CLI
 # ─────────────────────────────────────────────────────────────────────
 
 REPO_URL="https://github.com/xellDart/nebuia-embs.git"
+CRANE_REPO_URL="https://github.com/xellDart/Crane.git"
+CRANE_BRANCH="feat/colqwen3-embeddings"
 BRANCH="main"
 INSTALL_DIR=""
 FORCE_CPU=false
@@ -115,6 +118,34 @@ echo ""
 info "Checking prerequisites..."
 echo ""
 
+# ── Build essentials (cc, pkg-config, libssl-dev) ──
+if ! command -v cc &>/dev/null && ! command -v gcc &>/dev/null; then
+  info "C compiler not found. Installing build dependencies..."
+  if command -v apt-get &>/dev/null; then
+    sudo apt-get update -qq && sudo apt-get install -y -qq build-essential pkg-config libssl-dev
+  elif command -v dnf &>/dev/null; then
+    sudo dnf install -y gcc gcc-c++ make pkg-config openssl-devel
+  elif command -v pacman &>/dev/null; then
+    sudo pacman -Sy --noconfirm base-devel pkg-config openssl
+  else
+    fail "C compiler (cc/gcc) not found. Install build-essential or equivalent for your distro."
+  fi
+  ok "Build dependencies installed"
+else
+  # Ensure pkg-config and libssl-dev are present even if cc exists
+  if ! command -v pkg-config &>/dev/null; then
+    info "pkg-config not found. Installing..."
+    if command -v apt-get &>/dev/null; then
+      sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libssl-dev
+    elif command -v dnf &>/dev/null; then
+      sudo dnf install -y pkg-config openssl-devel
+    elif command -v pacman &>/dev/null; then
+      sudo pacman -Sy --noconfirm pkg-config openssl
+    fi
+  fi
+  ok "C compiler: $(cc --version 2>/dev/null | head -1 || gcc --version 2>/dev/null | head -1)"
+fi
+
 # ── Git ──
 if ! command -v git &>/dev/null; then
   fail "git is required. Install it: https://git-scm.com/"
@@ -145,31 +176,76 @@ CUDA_VERSION=""
 GPU_MEM=""
 
 if [ "$FORCE_CPU" = false ]; then
+  # Detect GPU via nvidia-smi first (works even without CUDA Toolkit)
+  if command -v nvidia-smi &>/dev/null; then
+    GPU_COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]')
+    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | sed 's/^[[:space:]]*//')
+    GPU_MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]')
+
+    if [ -n "$GPU_NAME" ]; then
+      ok "GPU: $GPU_NAME ($GPU_MEM, sm_${GPU_COMPUTE_CAP//./_})"
+    fi
+  fi
+
+  # Try to find nvcc: check PATH, then common install locations
+  NVCC_BIN=""
   if command -v nvcc &>/dev/null; then
-    CUDA_VERSION=$(nvcc --version | grep "release" | sed 's/.*release //' | sed 's/,.*//')
-    ok "CUDA: $CUDA_VERSION"
+    NVCC_BIN="$(command -v nvcc)"
+  else
+    for candidate in /usr/local/cuda/bin/nvcc /usr/local/cuda-*/bin/nvcc /opt/cuda/bin/nvcc; do
+      if [ -x "$candidate" ] 2>/dev/null; then
+        NVCC_BIN="$candidate"
+        CUDA_BIN_DIR="$(dirname "$NVCC_BIN")"
+        export PATH="$CUDA_BIN_DIR:$PATH"
+        info "Found nvcc at $NVCC_BIN (added to PATH)"
+        break
+      fi
+    done
+  fi
+
+  # If GPU detected but no CUDA Toolkit, install it
+  if [ -z "$NVCC_BIN" ] && [ -n "$GPU_NAME" ]; then
+    info "NVIDIA GPU detected but CUDA Toolkit (nvcc) not found. Installing..."
+    if command -v apt-get &>/dev/null; then
+      sudo apt-get update -qq && sudo apt-get install -y -qq nvidia-cuda-toolkit
+    elif command -v dnf &>/dev/null; then
+      sudo dnf install -y cuda-toolkit
+    elif command -v pacman &>/dev/null; then
+      sudo pacman -Sy --noconfirm cuda
+    else
+      fail "Could not auto-install CUDA Toolkit. Install manually: https://developer.nvidia.com/cuda-downloads"
+    fi
+    # Find nvcc after install
+    if command -v nvcc &>/dev/null; then
+      NVCC_BIN="$(command -v nvcc)"
+    else
+      for candidate in /usr/local/cuda/bin/nvcc /usr/local/cuda-*/bin/nvcc; do
+        if [ -x "$candidate" ] 2>/dev/null; then
+          NVCC_BIN="$candidate"
+          export PATH="$(dirname "$NVCC_BIN"):$PATH"
+          break
+        fi
+      done
+    fi
+  fi
+
+  if [ -n "$NVCC_BIN" ]; then
+    CUDA_VERSION=$("$NVCC_BIN" --version | grep "release" | sed 's/.*release //' | sed 's/,.*//')
+    ok "CUDA Toolkit: $CUDA_VERSION ($(dirname "$NVCC_BIN"))"
     HAS_CUDA=true
 
-    if command -v nvidia-smi &>/dev/null; then
-      GPU_COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]')
-      GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | sed 's/^[[:space:]]*//')
-      GPU_MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]')
-
-      if [ -n "$GPU_NAME" ]; then
-        ok "GPU: $GPU_NAME ($GPU_MEM, sm_${GPU_COMPUTE_CAP//./_})"
-      fi
-
-      if [ -n "$GPU_COMPUTE_CAP" ]; then
-        MAJOR=$(echo "$GPU_COMPUTE_CAP" | cut -d. -f1)
-        if [ "$MAJOR" -ge 8 ] 2>/dev/null; then
-          HAS_FLASH_ATTN=true
-          ok "Flash Attention: supported (SM_80+)"
-        fi
+    if [ -n "$GPU_COMPUTE_CAP" ]; then
+      MAJOR=$(echo "$GPU_COMPUTE_CAP" | cut -d. -f1)
+      if [ "$MAJOR" -ge 8 ] 2>/dev/null; then
+        HAS_FLASH_ATTN=true
+        ok "Flash Attention: supported (SM_80+)"
       fi
     fi
+  elif [ -n "$GPU_NAME" ]; then
+    warn "CUDA Toolkit installation failed. Building for CPU only."
+    warn "Install manually: https://developer.nvidia.com/cuda-downloads"
   else
-    warn "CUDA not found. Building for CPU only."
-    warn "For GPU: install CUDA Toolkit and ensure nvcc is in PATH."
+    warn "No NVIDIA GPU detected. Building for CPU only."
   fi
 else
   info "CPU-only build requested (--cpu)"
@@ -207,6 +283,27 @@ else
 fi
 
 ok "Project directory: $PROJECT_DIR"
+echo ""
+
+# ═════════════════════════════════════════════════════════════════════
+#  Step 2b: Clone / Update Crane dependency
+# ═════════════════════════════════════════════════════════════════════
+
+CRANE_DIR="$(dirname "$PROJECT_DIR")/Crane"
+
+if [ -d "$CRANE_DIR" ] && [ -d "$CRANE_DIR/.git" ]; then
+  info "Crane directory exists at $CRANE_DIR, updating..."
+  cd "$CRANE_DIR"
+  git fetch origin "$CRANE_BRANCH" 2>/dev/null || true
+  git checkout "$CRANE_BRANCH" 2>/dev/null || warn "Could not checkout $CRANE_BRANCH"
+  git pull --ff-only 2>/dev/null || warn "Could not pull Crane. Continuing with local version."
+  cd "$PROJECT_DIR"
+else
+  info "Cloning Crane (ColQwen3 embeddings engine)..."
+  git clone --branch "$CRANE_BRANCH" --depth 1 "$CRANE_REPO_URL" "$CRANE_DIR"
+fi
+
+ok "Crane directory: $CRANE_DIR"
 echo ""
 
 # ═════════════════════════════════════════════════════════════════════
@@ -287,6 +384,7 @@ echo -e "  ${BOLD}  nebuia-embs Installation Complete${RESET}"
 echo -e "  ${BOLD}${CYAN}════════════════════════════════════════════════${RESET}"
 echo ""
 echo "  Location:    $PROJECT_DIR"
+echo "  Crane:       $CRANE_DIR"
 echo "  Binary:      $BIN_PATH"
 echo "  Platform:    $(uname -s) $(uname -m)"
 echo "  Rust:        $(rustc --version 2>/dev/null)"
@@ -326,5 +424,5 @@ echo "    nebuia-ctl search <id> <query>  Test search"
 echo ""
 
 echo "  Re-run installer:  curl -fsSL https://raw.githubusercontent.com/xellDart/nebuia-embs/main/install.sh | bash"
-echo "  Rebuild only:      cd $PROJECT_DIR && cargo build --release --features cuda"
+echo "  Rebuild only:      cd $PROJECT_DIR && cargo build --release --features flash-attn"
 echo ""
