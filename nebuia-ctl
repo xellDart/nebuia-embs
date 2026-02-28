@@ -5,12 +5,15 @@ set -euo pipefail
 # nebuia-ctl — Service management CLI for nebuia-embs
 # ─────────────────────────────────────────────────────────────────────
 
-# Find project root (where this script lives)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Find project root (resolve symlinks to get real location)
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 BIN="$SCRIPT_DIR/target/release/nebuia-embs"
 PID_FILE="$SCRIPT_DIR/nebuia-embs.pid"
 LOG_FILE="$SCRIPT_DIR/nebuia-embs.log"
 ENV_FILE="$SCRIPT_DIR/.env"
+
+SERVICE_NAME="nebuia-embs"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 # ── Colors ──
 RED='\033[0;31m'
@@ -23,7 +26,22 @@ DIM='\033[2m'
 RESET='\033[0m'
 
 # ── Helpers ──
+is_systemd() {
+  [ -f "$SERVICE_FILE" ]
+}
+
 get_pid() {
+  if is_systemd; then
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+      local pid
+      pid=$(systemctl show -p MainPID --value "$SERVICE_NAME" 2>/dev/null)
+      if [ -n "$pid" ] && [ "$pid" != "0" ]; then
+        echo "$pid"
+        return 0
+      fi
+    fi
+    return 1
+  fi
   if [ -f "$PID_FILE" ]; then
     local pid
     pid=$(cat "$PID_FILE" 2>/dev/null)
@@ -77,6 +95,89 @@ banner() {
 #  Commands
 # ═════════════════════════════════════════════════════════════════════
 
+cmd_install() {
+  banner
+
+  if is_systemd; then
+    echo -e "  ${YELLOW}Service already installed${RESET}"
+    echo -e "  ${DIM}Use 'nebuia-ctl uninstall' first to reinstall${RESET}"
+    echo ""
+    return 0
+  fi
+
+  if [ ! -f "$BIN" ]; then
+    echo -e "  ${RED}Binary not found: $BIN${RESET}"
+    echo -e "  ${DIM}Build first: cargo build --release${RESET}"
+    return 1
+  fi
+
+  echo -e "  ${BLUE}Installing systemd service...${RESET}"
+
+  # Stop existing nohup process if running
+  if pid=$(get_pid); then
+    echo -e "  ${DIM}Stopping existing process (PID $pid)...${RESET}"
+    kill "$pid" 2>/dev/null || true
+    sleep 2
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    rm -f "$PID_FILE"
+  fi
+
+  local exec_start="$BIN"
+  [ -f "$ENV_FILE" ] && exec_start="$BIN --env-file $ENV_FILE"
+
+  sudo tee "$SERVICE_FILE" > /dev/null <<UNIT
+[Unit]
+Description=nebuia-embs — document embedding service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$exec_start
+WorkingDirectory=$SCRIPT_DIR
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=5
+User=$(whoami)
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable "$SERVICE_NAME" --quiet
+
+  echo ""
+  echo -e "  ${GREEN}${BOLD}Service installed${RESET}"
+  echo ""
+  echo -e "  ${DIM}Enabled${RESET}    starts on boot"
+  echo -e "  ${DIM}Restart${RESET}    automatic on failure"
+  echo -e "  ${DIM}Unit${RESET}       $SERVICE_FILE"
+  echo ""
+  echo -e "  ${DIM}Start now with: nebuia-ctl start${RESET}"
+  echo ""
+}
+
+cmd_uninstall() {
+  banner
+
+  if ! is_systemd; then
+    echo -e "  ${DIM}Service is not installed${RESET}"
+    echo ""
+    return 0
+  fi
+
+  echo -e "  ${BLUE}Uninstalling systemd service...${RESET}"
+
+  sudo systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+  sudo systemctl disable "$SERVICE_NAME" --quiet 2>/dev/null || true
+  sudo rm -f "$SERVICE_FILE"
+  sudo systemctl daemon-reload
+
+  echo -e "  ${GREEN}Service uninstalled${RESET}"
+  echo -e "  ${DIM}Auto-start on boot disabled${RESET}"
+  echo ""
+}
+
 cmd_start() {
   banner
   local port
@@ -97,53 +198,96 @@ cmd_start() {
 
   echo -e "  ${BLUE}Starting nebuia-embs...${RESET}"
 
-  local env_flag=""
-  [ -f "$ENV_FILE" ] && env_flag="--env-file $ENV_FILE"
+  local mode="standalone"
+  local bg_pid=""
 
-  # shellcheck disable=SC2086
-  RUST_LOG=info nohup "$BIN" $env_flag > "$LOG_FILE" 2>&1 &
-  local new_pid=$!
-  echo "$new_pid" > "$PID_FILE"
+  if is_systemd; then
+    mode="systemd"
+    sudo systemctl start "$SERVICE_NAME"
+  else
+    local env_flag=""
+    [ -f "$ENV_FILE" ] && env_flag="--env-file $ENV_FILE"
+
+    # shellcheck disable=SC2086
+    RUST_LOG=info nohup "$BIN" $env_flag > "$LOG_FILE" 2>&1 &
+    bg_pid=$!
+    echo "$bg_pid" > "$PID_FILE"
+  fi
 
   # Wait for model to load and server to be ready
   echo -ne "  ${DIM}Waiting for model to load"
   local waited=0
   while [ $waited -lt 60 ]; do
-    if ! kill -0 "$new_pid" 2>/dev/null; then
+    local alive=true
+    if [ "$mode" = "systemd" ]; then
+      systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null || alive=false
+    else
+      kill -0 "$bg_pid" 2>/dev/null || alive=false
+    fi
+
+    if ! $alive; then
       echo -e "${RESET}"
       echo -e "  ${RED}Service failed to start. Check logs:${RESET}"
-      echo -e "  ${DIM}tail -20 $LOG_FILE${RESET}"
+      echo -e "  ${DIM}nebuia-ctl log${RESET}"
       return 1
     fi
+
     if curl -sf "http://localhost:$port/health" >/dev/null 2>&1; then
       echo -e "${RESET}"
       echo ""
+      local running_pid
+      running_pid=$(get_pid) || running_pid="?"
       echo -e "  ${GREEN}${BOLD}Service started${RESET}"
       echo ""
-      echo -e "  ${DIM}PID${RESET}     $new_pid"
+      echo -e "  ${DIM}PID${RESET}     $running_pid"
       echo -e "  ${DIM}Port${RESET}    $port"
-      echo -e "  ${DIM}Logs${RESET}    $LOG_FILE"
+      if [ "$mode" = "systemd" ]; then
+        echo -e "  ${DIM}Logs${RESET}    journalctl -u $SERVICE_NAME"
+      else
+        echo -e "  ${DIM}Logs${RESET}    $LOG_FILE"
+      fi
       echo -e "  ${DIM}URL${RESET}     http://localhost:$port"
       echo ""
       return 0
     fi
+
     echo -n "."
     sleep 2
     waited=$((waited + 2))
   done
 
   echo -e "${RESET}"
-  if kill -0 "$new_pid" 2>/dev/null; then
-    echo -e "  ${YELLOW}Service started but health check not responding yet (PID $new_pid)${RESET}"
+  local still_alive=true
+  if [ "$mode" = "systemd" ]; then
+    systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null || still_alive=false
+  else
+    kill -0 "$bg_pid" 2>/dev/null || still_alive=false
+  fi
+
+  if $still_alive; then
+    echo -e "  ${YELLOW}Service started but health check not responding yet${RESET}"
     echo -e "  ${DIM}Model may still be loading. Check: nebuia-ctl status${RESET}"
   else
     echo -e "  ${RED}Service failed to start${RESET}"
-    echo -e "  ${DIM}tail -20 $LOG_FILE${RESET}"
+    echo -e "  ${DIM}nebuia-ctl log${RESET}"
   fi
 }
 
 cmd_stop() {
   banner
+
+  if is_systemd; then
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+      echo -e "  ${BLUE}Stopping nebuia-embs...${RESET}"
+      sudo systemctl stop "$SERVICE_NAME"
+      echo -e "  ${GREEN}Service stopped${RESET}"
+    else
+      echo -e "  ${DIM}Service is not running${RESET}"
+    fi
+    echo ""
+    return
+  fi
+
   if pid=$(get_pid); then
     echo -e "  ${BLUE}Stopping nebuia-embs (PID $pid)...${RESET}"
     kill "$pid" 2>/dev/null || true
@@ -179,7 +323,7 @@ cmd_status() {
 
   if pid=$(get_pid); then
     # Process info
-    local rss_kb vsize_kb threads start_time uptime_secs now_epoch start_epoch
+    local rss_kb vsize_kb threads start_epoch now_epoch uptime_secs
     rss_kb=$(awk '/VmRSS/ {print $2}' /proc/"$pid"/status 2>/dev/null || echo "0")
     vsize_kb=$(awk '/VmSize/ {print $2}' /proc/"$pid"/status 2>/dev/null || echo "0")
     threads=$(awk '/Threads/ {print $2}' /proc/"$pid"/status 2>/dev/null || echo "0")
@@ -206,39 +350,47 @@ cmd_status() {
     if [ -n "$gpu_mem" ] && [ "$gpu_mem" != "0" ]; then
       echo -e "  ${DIM}GPU mem${RESET}    ${gpu_mem} MiB"
     fi
-    echo -e "  ${DIM}Log${RESET}        $LOG_FILE"
+    if is_systemd; then
+      echo -e "  ${DIM}Mode${RESET}       systemd (auto-start on boot)"
+      echo -e "  ${DIM}Logs${RESET}       journalctl -u $SERVICE_NAME"
+    else
+      echo -e "  ${DIM}Mode${RESET}       standalone"
+      echo -e "  ${DIM}Log${RESET}        $LOG_FILE"
+    fi
 
     # Health check
     echo ""
     if health=$(curl -sf "http://localhost:$port/health" 2>/dev/null); then
-      local db_ok minio_ok model_ok
-      db_ok=$(echo "$health" | python3 -c "import sys,json; print(json.load(sys.stdin)['services']['database']['healthy'])" 2>/dev/null || echo "?")
-      minio_ok=$(echo "$health" | python3 -c "import sys,json; print(json.load(sys.stdin)['services']['minio']['healthy'])" 2>/dev/null || echo "?")
-      model_ok=$(echo "$health" | python3 -c "import sys,json; print(json.load(sys.stdin)['services']['model']['healthy'])" 2>/dev/null || echo "?")
-
-      printf "  %-12s" "Services"
-      [ "$db_ok" = "True" ]    && echo -ne "${GREEN}DB${RESET}  "    || echo -ne "${RED}DB${RESET}  "
-      [ "$minio_ok" = "True" ] && echo -ne "${GREEN}MinIO${RESET}  " || echo -ne "${RED}MinIO${RESET}  "
-      [ "$model_ok" = "True" ] && echo -ne "${GREEN}Model${RESET}"   || echo -ne "${RED}Model${RESET}"
-      echo ""
+      local svc_line="  ${DIM}Services${RESET}   "
+      echo "$health" | grep -q '"database":{"healthy":true}'  && svc_line+="${GREEN}DB${RESET}  "    || svc_line+="${RED}DB${RESET}  "
+      echo "$health" | grep -q '"minio":{"healthy":true}'     && svc_line+="${GREEN}MinIO${RESET}  " || svc_line+="${RED}MinIO${RESET}  "
+      echo "$health" | grep -q '"model":{"healthy":true}'     && svc_line+="${GREEN}Model${RESET}"   || svc_line+="${RED}Model${RESET}"
+      echo -e "$svc_line"
     else
       echo -e "  ${DIM}Services${RESET}   ${YELLOW}health check failed${RESET}"
     fi
   else
     echo -e "  ${RED}${BOLD}Service stopped${RESET}"
     echo ""
+    if is_systemd; then
+      echo -e "  ${DIM}Mode${RESET}       systemd (auto-start on boot)"
+    fi
     echo -e "  ${DIM}Start with: nebuia-ctl start${RESET}"
   fi
   echo ""
 }
 
 cmd_log() {
-  if [ ! -f "$LOG_FILE" ]; then
-    echo "No log file found at $LOG_FILE"
-    return 1
-  fi
   local lines="${1:-50}"
-  tail -f -n "$lines" "$LOG_FILE"
+  if is_systemd; then
+    journalctl -u "$SERVICE_NAME" -f -n "$lines"
+  else
+    if [ ! -f "$LOG_FILE" ]; then
+      echo "No log file found at $LOG_FILE"
+      return 1
+    fi
+    tail -f -n "$lines" "$LOG_FILE"
+  fi
 }
 
 cmd_health() {
@@ -247,7 +399,11 @@ cmd_health() {
   port=${port:-8000}
 
   if health=$(curl -sf "http://localhost:$port/health" 2>/dev/null); then
-    echo "$health" | python3 -m json.tool 2>/dev/null || echo "$health"
+    if command -v jq &>/dev/null; then
+      echo "$health" | jq .
+    else
+      echo "$health"
+    fi
   else
     echo -e "${RED}Service unreachable at http://localhost:$port${RESET}"
     return 1
@@ -269,7 +425,7 @@ cmd_search() {
   port=${port:-8000}
 
   local encoded_query
-  encoded_query=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$query'))" 2>/dev/null || echo "$query")
+  encoded_query=$(printf '%s' "$query" | sed 's/ /%20/g; s/"/%22/g; s/#/%23/g; s/&/%26/g; s/+/%2B/g; s/?/%3F/g')
 
   echo -e "${DIM}GET /simple/search/$doc_id?query=$query&k=$k${RESET}"
   echo ""
@@ -281,13 +437,16 @@ cmd_search() {
   elapsed_ms=$(( (end_ms - start_ms) / 1000000 ))
 
   if [ -n "$result" ]; then
-    echo "$result" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-for i, path in enumerate(data, 1):
-    page = path.split('_page_')[1].split('.')[0] if '_page_' in path else '?'
-    print(f'  {i}. page {page}  \033[2m{path}\033[0m')
-" 2>/dev/null || echo "$result"
+    if command -v jq &>/dev/null; then
+      echo "$result" | jq -r '.[] // empty' 2>/dev/null | nl -ba -w2 -s'. ' | while IFS= read -r line; do
+        path=$(echo "$line" | sed 's/^[0-9]*\. //')
+        num=$(echo "$line" | grep -o '^[0-9]*')
+        page=$(echo "$path" | grep -o '_page_[0-9]*' | sed 's/_page_//' || echo "?")
+        echo -e "  ${num}. page ${page}  ${DIM}${path}${RESET}"
+      done
+    else
+      echo "$result"
+    fi
     echo ""
     echo -e "  ${DIM}${elapsed_ms}ms${RESET}"
   else
@@ -312,7 +471,7 @@ cmd_process() {
   echo ""
   curl -sf -X POST "http://localhost:$port/process-pdf" \
     -H "Content-Type: application/json" \
-    -d "{\"document_id\": \"$doc_id\"}" 2>/dev/null | python3 -m json.tool 2>/dev/null
+    -d "{\"document_id\": \"$doc_id\"}" 2>/dev/null | { command -v jq &>/dev/null && jq . || cat; }
   echo ""
 }
 
@@ -324,22 +483,28 @@ CMD="${1:-help}"
 shift 2>/dev/null || true
 
 case "$CMD" in
-  start)   cmd_start ;;
-  stop)    cmd_stop ;;
-  restart) cmd_restart ;;
-  status)  cmd_status ;;
-  log)     cmd_log "$@" ;;
-  health)  cmd_health ;;
-  search)  cmd_search "$@" ;;
-  process) cmd_process "$@" ;;
+  install)   cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  start)     cmd_start ;;
+  stop)      cmd_stop ;;
+  restart)   cmd_restart ;;
+  status)    cmd_status ;;
+  log)       cmd_log "$@" ;;
+  health)    cmd_health ;;
+  search)    cmd_search "$@" ;;
+  process)   cmd_process "$@" ;;
   help|-h|--help)
     echo ""
     echo -e "  ${BOLD}${CYAN}nebuia-ctl${RESET} — manage nebuia-embs service"
     echo ""
     echo -e "  ${BOLD}Usage:${RESET} nebuia-ctl <command> [args]"
     echo ""
+    echo -e "  ${BOLD}Service:${RESET}"
+    echo "    install            Install systemd service (auto-start on boot)"
+    echo "    uninstall          Remove systemd service"
+    echo ""
     echo -e "  ${BOLD}Commands:${RESET}"
-    echo "    start              Start service as daemon"
+    echo "    start              Start service"
     echo "    stop               Stop running service"
     echo "    restart            Restart service"
     echo "    status             Show PID, memory, uptime, health"
@@ -350,6 +515,7 @@ case "$CMD" in
     echo "    help               Show this help"
     echo ""
     echo -e "  ${BOLD}Examples:${RESET}"
+    echo "    nebuia-ctl install                            Enable auto-start on boot"
     echo "    nebuia-ctl start"
     echo "    nebuia-ctl status"
     echo "    nebuia-ctl search abc-123 \"tabla de accionistas\""
