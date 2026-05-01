@@ -54,7 +54,13 @@ async fn main() -> Result<()> {
     let use_cpu = std::env::var("MODEL_DEVICE")
         .map(|d| d == "cpu")
         .unwrap_or(false);
-    let embedding = EmbeddingService::spawn(&config.model_path, use_cpu, config.use_bf16, config.model_dims)?;
+    let embedding = EmbeddingService::spawn(
+        &config.model_path,
+        use_cpu,
+        config.use_bf16,
+        config.model_dims,
+        config.model_queue_capacity,
+    )?;
 
     let cache = CacheService::new(config.cache_max_size, config.cache_expiry_hours);
 

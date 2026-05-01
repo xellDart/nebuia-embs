@@ -160,20 +160,16 @@ pub async fn search_document(
         anyhow::bail!("No pages found for document {}", document_id);
     }
 
-    // Get stored embeddings (cache or storage)
-    let page_embs = match cache.get(document_id).await {
-        Some(cached) => {
-            info!("Cache hit for document {}", document_id);
-            cached.as_ref().clone()
-        }
-        None => {
+    // Get stored embeddings — singleflight: N concurrent searches for the same
+    // document_id collapse to ONE storage download + deserialize.
+    let page_embs_arc = cache
+        .try_get_or_fetch(document_id, || async {
             info!("Cache miss for {}, downloading from storage", document_id);
             let raw = storage.get_embeddings(document_id).await?;
-            let embs = deserialize_embeddings(&raw)?;
-            cache.put(document_id, embs.clone()).await;
-            embs
-        }
-    };
+            deserialize_embeddings(&raw)
+        })
+        .await?;
+    let page_embs = page_embs_arc.as_ref().clone();
 
     // Encode query
     let query_embs = embedding.encode_query(query.to_string()).await?;

@@ -1,4 +1,5 @@
 use moka::future::Cache;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,5 +31,25 @@ impl CacheService {
 
     pub async fn remove(&self, document_id: &str) {
         self.cache.remove(document_id).await;
+    }
+
+    /// Singleflight fetch: if N concurrent callers ask for the same `document_id`
+    /// while it's NOT in cache, only ONE runs `fetcher`; the others wait and
+    /// receive the same Arc. Failures are also shared (as `Arc<anyhow::Error>`).
+    pub async fn try_get_or_fetch<F, Fut>(
+        &self,
+        document_id: &str,
+        fetcher: F,
+    ) -> anyhow::Result<Arc<Vec<PageEmbedding>>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<Vec<PageEmbedding>>>,
+    {
+        self.cache
+            .try_get_with(document_id.to_string(), async move {
+                fetcher().await.map(Arc::new)
+            })
+            .await
+            .map_err(|arc_err: Arc<anyhow::Error>| anyhow::anyhow!("{}", arc_err))
     }
 }

@@ -11,6 +11,9 @@ pub struct AppConfig {
     pub model_batch_size: usize,
     pub model_dims: Option<usize>,
     pub use_bf16: bool,
+    /// Max in-flight encode requests queued for the model thread.
+    /// When full, callers (HTTP/NATS) await on send → backpressure.
+    pub model_queue_capacity: usize,
     pub cache_max_size: u64,
     pub cache_expiry_hours: u64,
     pub nats_url: String,
@@ -33,6 +36,9 @@ impl AppConfig {
             model_batch_size: get("MODEL_BATCH_SIZE", Some("9")).parse().unwrap_or(9),
             model_dims: std::env::var("MODEL_DIMS").ok().and_then(|v| v.parse().ok()),
             use_bf16: get("MODEL_DTYPE", Some("bfloat16")) == "bfloat16",
+            model_queue_capacity: get("MODEL_QUEUE_CAPACITY", Some("8"))
+                .parse()
+                .unwrap_or(8),
             cache_max_size: get("CACHE_MAX_SIZE", Some("10")).parse().unwrap_or(10),
             cache_expiry_hours: get("CACHE_EXPIRY_HOURS", Some("24")).parse().unwrap_or(24),
             nats_url: get("NATS_URL", Some("nats://localhost:4222")),

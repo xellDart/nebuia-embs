@@ -1,6 +1,9 @@
 # Build
 /target/
 
+# Local model checkpoint (8GB)
+/colqwen3-4b/
+
 # Environment
 .env
 .env.*
