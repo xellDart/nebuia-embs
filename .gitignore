@@ -1,0 +1,24 @@
+# Build
+/target/
+
+# Local model checkpoint (8GB)
+/colqwen3-4b/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Runtime
+*.log
+*.pid
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
