@@ -9,10 +9,16 @@ use tracing::{info, warn};
 
 use crate::config::AppConfig;
 
-/// Hard ceiling per download attempt. The SDK's operation timeout does not cover
-/// response-body streaming, so a stalled transfer over a lossy/remote link can
-/// hang for minutes. Bound each attempt so a retry kicks in quickly instead.
+/// Hard ceiling per image download attempt. The SDK's operation timeout does not
+/// cover response-body streaming, so a stalled transfer can hang for minutes;
+/// bound each attempt so a retry kicks in instead. Images are small (~hundreds of
+/// KB) so 45s is already very generous.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Embeddings blobs are large (tens to >100 MB) and downloaded whole on a cache
+/// miss. Under a cold-cache burst several download concurrently and split
+/// bandwidth, so a single one can legitimately take far longer than an image.
+const EMBEDDINGS_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Clone)]
 pub struct StorageRepository {
@@ -192,7 +198,7 @@ impl StorageRepository {
         let mut last_err = None;
         for attempt in 1..=MAX_ATTEMPTS {
             let res = match tokio::time::timeout(
-                ATTEMPT_TIMEOUT,
+                EMBEDDINGS_ATTEMPT_TIMEOUT,
                 self.try_get_embeddings(document_id),
             )
             .await
