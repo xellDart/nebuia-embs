@@ -287,13 +287,16 @@ fn sort_consecutive_runs(ranked: Vec<(i32, String)>) -> Vec<String> {
         .collect()
 }
 
-/// Download a batch of images in parallel (4 concurrent).
+/// Download a batch of images in parallel (2 concurrent).
+/// Kept low on purpose: over a remote/lossy object-storage link, more concurrent
+/// streams compete for bandwidth and worsen each other's packet loss, making
+/// individual body reads stall. Two in flight balances throughput and reliability.
 async fn download_batch(storage: StorageRepository, names: Vec<String>) -> Result<Vec<Vec<u8>>> {
     let results: Vec<Result<Vec<u8>>> = stream::iter(names.into_iter().map(|name| {
         let st = storage.clone();
         async move { st.get_image(&name).await.map(|b| b.to_vec()) }
     }))
-    .buffered(4)
+    .buffered(2)
     .collect()
     .await;
 

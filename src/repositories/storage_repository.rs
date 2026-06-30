@@ -9,6 +9,11 @@ use tracing::{info, warn};
 
 use crate::config::AppConfig;
 
+/// Hard ceiling per download attempt. The SDK's operation timeout does not cover
+/// response-body streaming, so a stalled transfer over a lossy/remote link can
+/// hang for minutes. Bound each attempt so a retry kicks in quickly instead.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(45);
+
 #[derive(Clone)]
 pub struct StorageRepository {
     client: Client,
@@ -70,7 +75,13 @@ impl StorageRepository {
         const MAX_ATTEMPTS: u32 = 4;
         let mut last_err = None;
         for attempt in 1..=MAX_ATTEMPTS {
-            match self.try_get_image(object_name).await {
+            let res = match tokio::time::timeout(ATTEMPT_TIMEOUT, self.try_get_image(object_name))
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!("timed out after {}s", ATTEMPT_TIMEOUT.as_secs())),
+            };
+            match res {
                 Ok(bytes) => return Ok(bytes),
                 Err(e) => {
                     warn!(
@@ -180,7 +191,16 @@ impl StorageRepository {
         const MAX_ATTEMPTS: u32 = 4;
         let mut last_err = None;
         for attempt in 1..=MAX_ATTEMPTS {
-            match self.try_get_embeddings(document_id).await {
+            let res = match tokio::time::timeout(
+                ATTEMPT_TIMEOUT,
+                self.try_get_embeddings(document_id),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!("timed out after {}s", ATTEMPT_TIMEOUT.as_secs())),
+            };
+            match res {
                 Ok(data) => return Ok(data),
                 Err(e) => {
                     warn!(
