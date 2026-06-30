@@ -72,7 +72,7 @@ impl StorageRepository {
         // Retry each image independently. A single image failing its body read
         // (transient IO, connection reset, throughput stall) would otherwise
         // fail the whole batch and force NATS to re-download the entire document.
-        const MAX_ATTEMPTS: u32 = 4;
+        const MAX_ATTEMPTS: u32 = 6;
         let mut last_err = None;
         for attempt in 1..=MAX_ATTEMPTS {
             let res = match tokio::time::timeout(ATTEMPT_TIMEOUT, self.try_get_image(object_name))
@@ -188,7 +188,7 @@ impl StorageRepository {
     pub async fn get_embeddings(&self, document_id: &str) -> Result<Vec<u8>> {
         // Retry the whole fetch: a stalled/dropped body stream cannot be retried
         // by the SDK once streaming has started, so we re-issue the request.
-        const MAX_ATTEMPTS: u32 = 4;
+        const MAX_ATTEMPTS: u32 = 6;
         let mut last_err = None;
         for attempt in 1..=MAX_ATTEMPTS {
             let res = match tokio::time::timeout(
