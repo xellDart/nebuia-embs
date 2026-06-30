@@ -180,6 +180,13 @@ pub async fn search_document(
     // Build results
     let mut indexed: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
 
+    if indexed.is_empty() {
+        anyhow::bail!(
+            "No embeddings to score for document {} (stored embeddings empty or corrupt)",
+            document_id
+        );
+    }
+
     if continues {
         // Return k consecutive pages starting from the best match
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));

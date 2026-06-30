@@ -77,6 +77,24 @@ pub async fn save_pages_batch(
         return Ok(());
     }
 
+    // Drop duplicate page_numbers: a single INSERT ... ON CONFLICT DO UPDATE
+    // cannot touch the same conflict target row twice (Postgres errors out and
+    // the whole document fails). Duplicates arise when extract_page_number falls
+    // back to 0 on unparsable names or when two files map to the same page.
+    let mut seen = std::collections::HashSet::new();
+    let mut dedup_pages: Vec<i32> = Vec::with_capacity(page_numbers.len());
+    let mut dedup_paths: Vec<&str> = Vec::with_capacity(page_numbers.len());
+    for (pn, path) in page_numbers.iter().zip(image_paths.iter()) {
+        if seen.insert(*pn) {
+            dedup_pages.push(*pn);
+            dedup_paths.push(path);
+        } else {
+            tracing::warn!("Skipping duplicate page_number {} for {}", pn, document_id);
+        }
+    }
+    let page_numbers = &dedup_pages[..];
+    let image_paths = &dedup_paths[..];
+
     // Build batch insert with typed bindings
     // id: text, document_id: text, page_number: int4, image_path: text
     let mut query = String::from(

@@ -58,6 +58,30 @@ impl StorageRepository {
     }
 
     pub async fn get_image(&self, object_name: &str) -> Result<Bytes> {
+        // Retry each image independently. A single image failing its body read
+        // (transient IO, connection reset, throughput stall) would otherwise
+        // fail the whole batch and force NATS to re-download the entire document.
+        const MAX_ATTEMPTS: u32 = 4;
+        let mut last_err = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.try_get_image(object_name).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) => {
+                    warn!(
+                        "get_image {} attempt {}/{} failed: {}",
+                        object_name, attempt, MAX_ATTEMPTS, e
+                    );
+                    last_err = Some(e);
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(300 * attempt as u64)).await;
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("get_image failed: {}", object_name)))
+    }
+
+    async fn try_get_image(&self, object_name: &str) -> Result<Bytes> {
         let resp = self
             .client
             .get_object()
