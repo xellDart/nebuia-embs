@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
-use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::config::{Credentials, Region, StalledStreamProtectionConfig};
 use aws_sdk_s3::primitives::ByteStream;
+use std::time::Duration;
 use bytes::Bytes;
 use tracing::{info, warn};
 
@@ -35,6 +36,17 @@ impl StorageRepository {
             .endpoint_url(&endpoint)
             .credentials_provider(creds)
             .force_path_style(true)
+            // The SDK aborts a transfer if throughput drops below the minimum for
+            // the grace period (5s by default). With several concurrent downloads
+            // of large images over a remote MinIO, bandwidth contention can stall
+            // individual streams past that window, surfacing as "Failed to read
+            // image body". A 30s grace period tolerates the slowdown while still
+            // protecting against genuinely dead connections.
+            .stalled_stream_protection(
+                StalledStreamProtectionConfig::enabled()
+                    .grace_period(Duration::from_secs(30))
+                    .build(),
+            )
             .build();
 
         let client = Client::from_conf(s3_config);
