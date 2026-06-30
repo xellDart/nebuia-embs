@@ -48,6 +48,15 @@ pub async fn run_nats_consumer(state: Arc<AppState>) -> Result<()> {
         })
         .await?;
 
+    // A durable consumer that already exists is NOT reconfigured by
+    // get_or_create_consumer, so changes to ack_wait/max_deliver in code would
+    // silently not apply. Delete it first (ignoring "not found") and recreate so
+    // the config below is always authoritative. Unacked messages are redelivered.
+    match stream.delete_consumer("embeddings_workers").await {
+        Ok(_) => info!("NATS: removed existing consumer to apply current config"),
+        Err(e) => info!("NATS: no existing consumer to remove ({})", e),
+    }
+
     let consumer = stream
         .get_or_create_consumer(
             "embeddings_workers",
