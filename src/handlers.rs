@@ -70,10 +70,23 @@ pub async fn process_pdf(
         ));
     }
 
+    // Skip if this document is already being processed (e.g. by NATS).
+    let guard = match state.try_claim(&document_id) {
+        Some(g) => g,
+        None => {
+            return Ok(Json(MessageResponse {
+                document_id: Some(document_id),
+                message: "Document is already being processed".into(),
+                status: Some("processing".into()),
+            }));
+        }
+    };
+
     // Spawn background task
     let state_clone = state.clone();
     let doc_id = document_id.clone();
     tokio::spawn(async move {
+        let _guard = guard; // releases the claim when processing finishes
         let _permit = state_clone.process_semaphore.clone().acquire_owned().await;
         if let Err(e) = pdf_service::process_document_embeddings(
             &doc_id,

@@ -150,6 +150,20 @@ async fn process_message(
 ) {
     info!("NATS: processing document {}", document_id);
 
+    // Skip if another task (HTTP endpoint or a duplicate delivery) is already
+    // processing this document. NAK with a short delay so the job is retried
+    // once the in-flight run finishes, rather than dropped.
+    let _claim = match state.try_claim(&document_id) {
+        Some(g) => g,
+        None => {
+            info!("NATS: document {} already in flight, NAK to retry", document_id);
+            let _ = msg
+                .ack_with(AckKind::Nak(Some(Duration::from_secs(5))))
+                .await;
+            return;
+        }
+    };
+
     let processing = crate::services::pdf_service::process_document_embeddings(
         &document_id,
         &state.db_pool,

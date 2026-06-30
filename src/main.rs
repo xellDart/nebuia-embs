@@ -98,6 +98,7 @@ async fn main() -> Result<()> {
         embedding,
         cache,
         process_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     });
 
     // Start NATS consumer if enabled
