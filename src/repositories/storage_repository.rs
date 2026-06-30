@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
+use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::config::{Credentials, Region, StalledStreamProtectionConfig};
 use aws_sdk_s3::primitives::ByteStream;
 use std::time::Duration;
@@ -36,6 +37,11 @@ impl StorageRepository {
             .endpoint_url(&endpoint)
             .credentials_provider(creds)
             .force_path_style(true)
+            // Retry transient failures on a fresh connection. MinIO keep-alive
+            // connections that go idle get dropped by NAT/firewall; reusing one
+            // surfaces as "connection should not be re-used" → the SDK poisons it
+            // and a retry grabs a new connection. Covers list/put/delete/head.
+            .retry_config(RetryConfig::standard().with_max_attempts(6))
             // The SDK aborts a transfer if throughput drops below the minimum for
             // the grace period (5s by default). With several concurrent downloads
             // of large images over a remote MinIO, bandwidth contention can stall
@@ -169,6 +175,29 @@ impl StorageRepository {
     }
 
     pub async fn get_embeddings(&self, document_id: &str) -> Result<Vec<u8>> {
+        // Retry the whole fetch: a stalled/dropped body stream cannot be retried
+        // by the SDK once streaming has started, so we re-issue the request.
+        const MAX_ATTEMPTS: u32 = 4;
+        let mut last_err = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.try_get_embeddings(document_id).await {
+                Ok(data) => return Ok(data),
+                Err(e) => {
+                    warn!(
+                        "get_embeddings {} attempt {}/{} failed: {}",
+                        document_id, attempt, MAX_ATTEMPTS, e
+                    );
+                    last_err = Some(e);
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(300 * attempt as u64)).await;
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("get_embeddings failed: {}", document_id)))
+    }
+
+    async fn try_get_embeddings(&self, document_id: &str) -> Result<Vec<u8>> {
         let object_name = format!("{}_embeddings.zst", document_id);
 
         let resp = self
