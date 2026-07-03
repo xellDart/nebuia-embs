@@ -222,18 +222,23 @@ async fn process_message(
                     .await;
                 let _ = msg.ack().await;
             } else {
-                error!(
-                    "NATS: failed document {} (attempt {}), will retry: {}",
-                    document_id, delivered, err_str
-                );
-                // Always back off a little before redelivery to avoid hot-looping.
-                let delay = if err_str.contains("pool timed out")
-                    || err_str.contains("connection")
-                {
-                    Duration::from_secs(3)
-                } else {
-                    Duration::from_secs(2)
+                // Exponential backoff by delivery count: a transient blip retries
+                // fast, while a sustained outage (DB/storage unreachable) spreads
+                // the remaining attempts over ~13 minutes instead of burning all
+                // MAX_DELIVER tries in seconds.
+                let delay = match delivered {
+                    1 => Duration::from_secs(5),
+                    2 => Duration::from_secs(30),
+                    3 => Duration::from_secs(120),
+                    _ => Duration::from_secs(600),
                 };
+                error!(
+                    "NATS: failed document {} (attempt {}), retry in {}s: {}",
+                    document_id,
+                    delivered,
+                    delay.as_secs(),
+                    err_str
+                );
                 let _ = msg.ack_with(AckKind::Nak(Some(delay))).await;
             }
         }
