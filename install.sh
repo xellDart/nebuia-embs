@@ -264,16 +264,26 @@ if [ -f "Cargo.toml" ] && grep -q 'name = "nebuia-embs"' Cargo.toml 2>/dev/null;
   PROJECT_DIR="$(pwd)"
 fi
 
+# Update the current repo to the tip of $BRANCH explicitly: a bare `git pull`
+# only updates whatever branch happens to be checked out, so a clone left on a
+# feature branch would silently skip the latest main.
+update_nebuia_repo() {
+  git fetch origin "$BRANCH" 2>/dev/null \
+    && git checkout "$BRANCH" 2>/dev/null \
+    && git merge --ff-only "origin/$BRANCH" \
+    || warn "Could not update to origin/$BRANCH (local changes or diverged?). Continuing with local version."
+}
+
 if [ "$INSIDE_REPO" = true ]; then
   info "Already inside nebuia-embs repository: $PROJECT_DIR"
-  info "Pulling latest changes..."
-  git pull --ff-only 2>/dev/null || warn "Could not pull (uncommitted changes?). Continuing with local version."
+  info "Updating to latest $BRANCH..."
+  update_nebuia_repo
 else
   [ -z "$INSTALL_DIR" ] && INSTALL_DIR="nebuia-embs"
   if [ -d "$INSTALL_DIR" ] && [ -f "$INSTALL_DIR/Cargo.toml" ]; then
-    info "nebuia-embs directory exists at $INSTALL_DIR, updating..."
+    info "nebuia-embs directory exists at $INSTALL_DIR, updating to latest $BRANCH..."
     cd "$INSTALL_DIR"
-    git pull --ff-only 2>/dev/null || warn "Could not pull. Continuing with local version."
+    update_nebuia_repo
   else
     info "Cloning nebuia-embs..."
     git clone --branch "$BRANCH" --depth 1 "$REPO_URL" "$INSTALL_DIR"

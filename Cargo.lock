@@ -1303,6 +1303,7 @@ dependencies = [
  "candle-transformers",
  "half",
  "image",
+ "rayon",
  "serde",
  "serde_json",
  "tokenizers",
