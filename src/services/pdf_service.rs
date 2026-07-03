@@ -407,7 +407,10 @@ fn sort_consecutive_runs(ranked: Vec<(i32, String)>) -> Vec<String> {
 }
 
 /// Download a batch of images in parallel (4 concurrent).
-async fn download_batch(storage: StorageRepository, names: Vec<String>) -> Result<Vec<Vec<u8>>> {
+pub(crate) async fn download_batch(
+    storage: StorageRepository,
+    names: Vec<String>,
+) -> Result<Vec<Vec<u8>>> {
     let results: Vec<Result<Vec<u8>>> = stream::iter(names.into_iter().map(|name| {
         let st = storage.clone();
         async move { st.get_image(&name).await.map(|b| b.to_vec()) }
@@ -419,7 +422,7 @@ async fn download_batch(storage: StorageRepository, names: Vec<String>) -> Resul
     results.into_iter().collect()
 }
 
-fn extract_page_number(name: &str) -> i32 {
+pub(crate) fn extract_page_number(name: &str) -> i32 {
     // Format: "{document_id}_page_{N}.jpeg"
     name.rsplit("_page_")
         .next()

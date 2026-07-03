@@ -24,6 +24,31 @@ struct Args {
     /// Path to .env file
     #[arg(long, default_value = ".env")]
     env_file: String,
+
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Cmd {
+    /// Regression harness: record or compare golden search results for a document
+    Regression {
+        /// Document id (default: most recent complete doc with 10-100 pages)
+        #[arg(long)]
+        doc: Option<String>,
+        /// Write the baseline instead of comparing against it
+        #[arg(long)]
+        record: bool,
+        /// Comma-separated queries (default: built-in set)
+        #[arg(long, value_delimiter = ',')]
+        queries: Vec<String>,
+        /// Baseline directory
+        #[arg(long, default_value = "regression")]
+        dir: String,
+        /// Max allowed |Δ| per embedding value when comparing (0 = bit-exact)
+        #[arg(long, default_value_t = 0.0)]
+        tol: f32,
+    },
 }
 
 #[tokio::main]
@@ -37,6 +62,17 @@ async fn main() -> Result<()> {
         dotenvy::from_filename(&args.env_file)?;
     }
     let config = AppConfig::from_env();
+
+    if let Some(Cmd::Regression {
+        doc,
+        record,
+        queries,
+        dir,
+        tol,
+    }) = args.cmd
+    {
+        return services::regression::run(config, doc, record, queries, dir, tol).await;
+    }
 
     info!("Connecting to database...");
 
