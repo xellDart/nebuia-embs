@@ -5,12 +5,17 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
 
 /// Serialized embedding: list of pages, each page is (seq_len, dims) flattened.
-/// Stored as bf16 (2 bytes) for storage, converted to f32 for scoring.
+///
+/// Kept as bf16 end-to-end: it's the exact storage format (lossless
+/// serialize/deserialize), halves RAM in cache and PCIe transfer per search.
+/// The model computes in bf16, so its outputs are bf16-representable and this
+/// loses nothing; scoring upcasts to f32 ON DEVICE, which is exact, so scores
+/// are bit-identical to expanding on the CPU as before.
 #[derive(Debug, Clone)]
 pub struct PageEmbedding {
     pub seq_len: usize,
     pub dims: usize,
-    pub data: Vec<f32>,
+    pub data: Vec<half::bf16>,
 }
 
 struct ImagesRequest {
@@ -181,7 +186,12 @@ fn tensor_to_page_embedding(t: &Tensor) -> Result<PageEmbedding> {
         2 => (dims[0], dims[1]),
         _ => anyhow::bail!("Expected 2D tensor, got {}D", dims.len()),
     };
-    let data: Vec<f32> = t.to_dtype(candle_core::DType::F32)?.flatten_all()?.to_vec1()?;
+    // Model outputs are bf16 already (or exactly representable); no-op cast in
+    // the common case, and matches the on-disk format bit for bit.
+    let data: Vec<half::bf16> = t
+        .to_dtype(candle_core::DType::BF16)?
+        .flatten_all()?
+        .to_vec1()?;
     Ok(PageEmbedding {
         seq_len,
         dims: d,
@@ -216,12 +226,10 @@ fn encode_query(
 // ── Score function (runs on tokio blocking pool, no model dependency) ──
 
 fn page_embedding_to_tensor(emb: &PageEmbedding, device: &Device) -> Result<Tensor> {
-    // from_slice copies straight into tensor storage — no intermediate Vec clone.
-    Ok(Tensor::from_slice(
-        &emb.data,
-        (emb.seq_len, emb.dims),
-        device,
-    )?)
+    // Transfer to device as bf16 (half the PCIe traffic), then upcast to f32
+    // ON DEVICE. bf16→f32 is exact, so the scoring math is unchanged.
+    Ok(Tensor::from_slice(&emb.data, (emb.seq_len, emb.dims), device)?
+        .to_dtype(candle_core::DType::F32)?)
 }
 
 fn score_on_device(
@@ -260,6 +268,7 @@ fn score_on_device(
 
 /// Serialize page embeddings to raw bytes as bf16:
 /// [num_pages(u32), then for each page: seq_len(u32), dims(u32), bf16 data...]
+/// Data is already bf16 in memory, so this is a pure byte copy (lossless).
 pub fn serialize_embeddings(embeddings: &[PageEmbedding]) -> Vec<u8> {
     let total: usize = 4 + embeddings
         .iter()
@@ -271,7 +280,7 @@ pub fn serialize_embeddings(embeddings: &[PageEmbedding]) -> Vec<u8> {
         buf.extend_from_slice(&(emb.seq_len as u32).to_le_bytes());
         buf.extend_from_slice(&(emb.dims as u32).to_le_bytes());
         for &val in &emb.data {
-            buf.extend_from_slice(&half::bf16::from_f32(val).to_le_bytes());
+            buf.extend_from_slice(&val.to_le_bytes());
         }
     }
     buf
@@ -303,20 +312,19 @@ pub fn deserialize_embeddings(data: &[u8]) -> Result<Vec<PageEmbedding>> {
             anyhow::bail!("Unexpected end of embeddings data");
         }
 
-        // bf16 bits are the top 16 bits of the equivalent f32 — a shift is the
-        // exact conversion, ~memcpy speed vs per-value half decoding.
-        let mut float_data = Vec::with_capacity(num_values);
-        float_data.extend(
+        // Stays bf16 in memory: deserialization is a pure byte copy.
+        let mut values = Vec::with_capacity(num_values);
+        values.extend(
             data[cursor..cursor + byte_len]
                 .chunks_exact(2)
-                .map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16)),
+                .map(|b| half::bf16::from_le_bytes([b[0], b[1]])),
         );
         cursor += byte_len;
 
         embeddings.push(PageEmbedding {
             seq_len,
             dims,
-            data: float_data,
+            data: values,
         });
     }
 
@@ -328,11 +336,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn serialize_deserialize_roundtrip_matches_bf16() {
-        let values: Vec<f32> = vec![
-            0.0, -0.0, 1.0, -1.0, 0.123456, -3.14159, 1e-20, -1e-20, 65504.0, 1e30, -1e30,
+    fn serialize_deserialize_roundtrip_is_lossless() {
+        let values: Vec<half::bf16> = [
+            0.0f32, -0.0, 1.0, -1.0, 0.123456, -3.14159, 1e-20, -1e-20, 65504.0, 1e30, -1e30,
             f32::MIN_POSITIVE, 0.999999,
-        ];
+        ]
+        .iter()
+        .map(|v| half::bf16::from_f32(*v))
+        .collect();
         let page = PageEmbedding {
             seq_len: values.len(),
             dims: 1,
@@ -344,10 +355,9 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].seq_len, values.len());
         assert_eq!(out[0].dims, 1);
+        // bf16 in memory == bf16 on disk: the roundtrip must be bit-exact.
         for (orig, got) in values.iter().zip(out[0].data.iter()) {
-            // The shift-based decode must agree exactly with the half crate.
-            let expected = half::bf16::from_f32(*orig).to_f32();
-            assert_eq!(expected.to_bits(), got.to_bits(), "value {}", orig);
+            assert_eq!(orig.to_bits(), got.to_bits());
         }
     }
 
@@ -356,7 +366,7 @@ mod tests {
         let page = PageEmbedding {
             seq_len: 4,
             dims: 2,
-            data: vec![1.0; 8],
+            data: vec![half::bf16::from_f32(1.0); 8],
         };
         let raw = serialize_embeddings(&[page]);
         assert!(deserialize_embeddings(&raw[..raw.len() - 3]).is_err());

@@ -3,6 +3,7 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::config::{Credentials, Region, StalledStreamProtectionConfig};
 use aws_sdk_s3::primitives::ByteStream;
+use futures_util::stream::{self, StreamExt};
 use std::time::Duration;
 use bytes::Bytes;
 use tracing::{info, warn};
@@ -19,6 +20,11 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(45);
 /// miss. Under a cold-cache burst several download concurrently and split
 /// bandwidth, so a single one can legitimately take far longer than an image.
 const EMBEDDINGS_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Blobs above one part are fetched as concurrent range GETs: a single
+/// sequential stream rarely saturates the link to remote storage.
+const EMB_PART_SIZE: usize = 8 * 1024 * 1024;
+const EMB_PART_CONCURRENCY: usize = 6;
 
 #[derive(Clone)]
 pub struct StorageRepository {
@@ -227,30 +233,100 @@ impl StorageRepository {
     async fn try_get_embeddings(&self, document_id: &str) -> Result<Vec<u8>> {
         let object_name = format!("{}_embeddings.zst", document_id);
 
-        let resp = self
+        // Size first, to decide between one GET and parallel range GETs.
+        let size = self
             .client
-            .get_object()
+            .head_object()
             .bucket(&self.bucket)
             .key(&object_name)
             .send()
             .await
-            .with_context(|| format!("Failed to get embeddings for {}", document_id))?;
+            .with_context(|| format!("Failed to head embeddings for {}", document_id))?
+            .content_length()
+            .unwrap_or(0)
+            .max(0) as usize;
 
-        let compressed = resp
-            .body
-            .collect()
-            .await
-            .context("Failed to read embeddings body")?
-            .into_bytes();
+        let compressed: Vec<u8> = if size > EMB_PART_SIZE {
+            self.get_object_ranged(&object_name, size).await?
+        } else {
+            // Small blob (or size unknown): plain single GET.
+            self.client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&object_name)
+                .send()
+                .await
+                .with_context(|| format!("Failed to get embeddings for {}", document_id))?
+                .body
+                .collect()
+                .await
+                .context("Failed to read embeddings body")?
+                .into_bytes()
+                .to_vec()
+        };
 
         // zstd decode of a large blob is CPU-bound; keep it off async workers.
         let decompressed = tokio::task::spawn_blocking(move || {
-            zstd::decode_all(compressed.as_ref())
+            zstd::decode_all(&compressed[..])
         })
         .await?
         .context("Failed to decompress embeddings")?;
 
         Ok(decompressed)
+    }
+
+    /// Download an object as EMB_PART_SIZE range GETs, EMB_PART_CONCURRENCY at
+    /// a time. Parts arrive in order (buffered stream) and are concatenated.
+    async fn get_object_ranged(&self, key: &str, size: usize) -> Result<Vec<u8>> {
+        let ranges: Vec<(usize, usize)> = (0..size)
+            .step_by(EMB_PART_SIZE)
+            .map(|start| (start, (start + EMB_PART_SIZE).min(size) - 1))
+            .collect();
+        info!(
+            "Downloading {} ({}) in {} parallel parts",
+            key,
+            format_size(size),
+            ranges.len()
+        );
+
+        let parts: Vec<Result<Bytes>> = stream::iter(ranges.into_iter().map(|(start, end)| {
+            let client = self.client.clone();
+            let bucket = self.bucket.clone();
+            let key = key.to_string();
+            async move {
+                let resp = client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .range(format!("bytes={}-{}", start, end))
+                    .send()
+                    .await
+                    .with_context(|| format!("range {}-{} of {}", start, end, key))?;
+                let bytes = resp
+                    .body
+                    .collect()
+                    .await
+                    .with_context(|| format!("read range {}-{} of {}", start, end, key))?
+                    .into_bytes();
+                anyhow::ensure!(
+                    bytes.len() == end - start + 1,
+                    "short range read of {}: got {} expected {}",
+                    key,
+                    bytes.len(),
+                    end - start + 1
+                );
+                Ok(bytes)
+            }
+        }))
+        .buffered(EMB_PART_CONCURRENCY)
+        .collect()
+        .await;
+
+        let mut out = Vec::with_capacity(size);
+        for part in parts {
+            out.extend_from_slice(&part?);
+        }
+        Ok(out)
     }
 
     pub async fn delete_objects(&self, keys: &[String]) -> Result<()> {

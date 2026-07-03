@@ -25,9 +25,10 @@ impl CacheService {
         let embeddings = Cache::builder()
             .max_capacity(max_mb.saturating_mul(1024 * 1024))
             .weigher(|_k: &String, v: &Arc<Vec<PageEmbedding>>| {
+                // Embeddings live in RAM as bf16 (2 bytes per value).
                 let bytes: usize = v
                     .iter()
-                    .map(|p| p.data.len() * std::mem::size_of::<f32>() + 48)
+                    .map(|p| p.data.len() * 2 + 48)
                     .sum::<usize>()
                     + 64;
                 u32::try_from(bytes).unwrap_or(u32::MAX)
