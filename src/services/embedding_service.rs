@@ -13,25 +13,25 @@ pub struct PageEmbedding {
     pub data: Vec<f32>,
 }
 
-/// Encode-only requests run on the dedicated model thread (single stream of inference).
-/// Score requests do NOT go here — they run on the tokio blocking pool sharing
-/// only the device handle, so search latency is not blocked behind heavy encode jobs.
-enum EncodeRequest {
-    Images {
-        images: Vec<Vec<u8>>,
-        reply: oneshot::Sender<Result<Vec<PageEmbedding>>>,
-    },
-    Query {
-        query: String,
-        reply: oneshot::Sender<Result<Vec<PageEmbedding>>>,
-    },
+struct ImagesRequest {
+    images: Vec<Vec<u8>>,
+    reply: oneshot::Sender<Result<Vec<PageEmbedding>>>,
+}
+
+struct QueryRequest {
+    query: String,
+    reply: oneshot::Sender<Result<Vec<PageEmbedding>>>,
 }
 
 #[derive(Clone)]
 pub struct EmbeddingService {
     /// Bounded sender → applies backpressure to HTTP/NATS callers when the
     /// model is saturated (instead of growing memory unboundedly).
-    encode_tx: mpsc::Sender<EncodeRequest>,
+    images_tx: mpsc::Sender<ImagesRequest>,
+    /// Queries take a separate, prioritized lane: the model thread drains all
+    /// pending queries before picking up the next image batch, so a search
+    /// never waits behind multi-second document encodes.
+    query_tx: mpsc::Sender<QueryRequest>,
     /// Device handle used by score() on a separate (blocking) task.
     /// Same physical GPU as the model; CUDA driver schedules concurrent kernels.
     device: Arc<Device>,
@@ -39,13 +39,16 @@ pub struct EmbeddingService {
 
 impl EmbeddingService {
     /// Spawn the model on a dedicated thread. `queue_capacity` bounds the
-    /// in-flight encode queue (caller `send().await` blocks when full).
+    /// in-flight image-encode queue (caller `send().await` blocks when full).
+    /// `image_batch` is how many images are encoded per model forward
+    /// (1 = one at a time; >1 batches the vision tower, more VRAM).
     pub fn spawn(
         model_path: &str,
         use_cpu: bool,
         use_bf16: bool,
         target_dims: Option<usize>,
         queue_capacity: usize,
+        image_batch: usize,
     ) -> Result<Self> {
         // Build the score-side device on the calling thread so we can hand it
         // back to the service immediately, even if the model thread is still loading.
@@ -56,8 +59,13 @@ impl EmbeddingService {
         };
         let device = Arc::new(device);
 
-        let (tx, mut rx) = mpsc::channel::<EncodeRequest>(queue_capacity.max(1));
+        let (images_tx, mut images_rx) = mpsc::channel::<ImagesRequest>(queue_capacity.max(1));
+        let (query_tx, mut query_rx) = mpsc::channel::<QueryRequest>(64);
         let path = model_path.to_string();
+        let image_batch = image_batch.max(1);
+
+        // Handle used only to await the two channels from the model thread.
+        let rt = tokio::runtime::Handle::current();
 
         std::thread::Builder::new()
             .name("embedding-model".into())
@@ -77,27 +85,44 @@ impl EmbeddingService {
                     info!("Embedding dims set to {}", dims);
                 }
                 info!(
-                    "Embedding model ready (encode queue capacity: {})",
-                    queue_capacity
+                    "Embedding model ready (image queue: {}, image batch: {})",
+                    queue_capacity, image_batch
                 );
 
-                while let Some(req) = rx.blocking_recv() {
-                    match req {
-                        EncodeRequest::Images { images, reply } => {
-                            let result = encode_images_from_bytes(&mut model, &images);
-                            let _ = reply.send(result);
+                loop {
+                    // Biased select: pending queries always win over image batches.
+                    // A closed channel disables its branch; `else` fires when both
+                    // are closed → shutdown.
+                    enum Req {
+                        Query(QueryRequest),
+                        Images(ImagesRequest),
+                    }
+                    let req = rt.block_on(async {
+                        tokio::select! {
+                            biased;
+                            Some(q) = query_rx.recv() => Some(Req::Query(q)),
+                            Some(i) = images_rx.recv() => Some(Req::Images(i)),
+                            else => None,
                         }
-                        EncodeRequest::Query { query, reply } => {
+                    });
+                    match req {
+                        Some(Req::Query(QueryRequest { query, reply })) => {
                             let result = encode_query(&mut model, &query);
                             let _ = reply.send(result);
                         }
+                        Some(Req::Images(ImagesRequest { images, reply })) => {
+                            let result = encode_images_from_bytes(&mut model, &images, image_batch);
+                            let _ = reply.send(result);
+                        }
+                        None => break,
                     }
                 }
                 info!("Embedding model thread shutting down");
             })?;
 
         Ok(Self {
-            encode_tx: tx,
+            images_tx,
+            query_tx,
             device,
         })
     }
@@ -105,8 +130,8 @@ impl EmbeddingService {
     /// Submit images for encoding. **Awaits** if the queue is full → backpressure.
     pub async fn encode_images_from_bytes(&self, images: Vec<Vec<u8>>) -> Result<Vec<PageEmbedding>> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.encode_tx
-            .send(EncodeRequest::Images {
+        self.images_tx
+            .send(ImagesRequest {
                 images,
                 reply: reply_tx,
             })
@@ -115,11 +140,11 @@ impl EmbeddingService {
         reply_rx.await?
     }
 
-    /// Submit a query for encoding. **Awaits** if the queue is full → backpressure.
+    /// Submit a query for encoding on the prioritized lane.
     pub async fn encode_query(&self, query: String) -> Result<Vec<PageEmbedding>> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.encode_tx
-            .send(EncodeRequest::Query {
+        self.query_tx
+            .send(QueryRequest {
                 query,
                 reply: reply_tx,
             })
@@ -132,10 +157,11 @@ impl EmbeddingService {
     ///
     /// Runs on the tokio blocking pool, NOT on the model thread — so a search
     /// request never queues behind a long-running document encode.
+    /// Takes the cached pages by Arc: no deep copy of the embeddings.
     pub async fn score(
         &self,
         query_embs: Vec<PageEmbedding>,
-        page_embs: Vec<PageEmbedding>,
+        page_embs: Arc<Vec<PageEmbedding>>,
     ) -> Result<Vec<f32>> {
         let device = self.device.clone();
         tokio::task::spawn_blocking(move || score_on_device(&device, &query_embs, &page_embs))
@@ -143,12 +169,12 @@ impl EmbeddingService {
     }
 
     pub fn is_alive(&self) -> bool {
-        !self.encode_tx.is_closed()
+        !self.images_tx.is_closed()
     }
 
-    /// Approximate number of slots free in the encode queue (for metrics).
+    /// Approximate number of slots free in the image-encode queue (for metrics).
     pub fn encode_capacity_available(&self) -> usize {
-        self.encode_tx.capacity()
+        self.images_tx.capacity()
     }
 }
 
@@ -171,10 +197,12 @@ fn tensor_to_page_embedding(t: &Tensor) -> Result<PageEmbedding> {
 fn encode_images_from_bytes(
     model: &mut crane_core::models::colqwen3_emb::ColQwen3Emb,
     images: &[Vec<u8>],
+    image_batch: usize,
 ) -> Result<Vec<PageEmbedding>> {
-    let mut all = Vec::new();
-    for img_bytes in images {
-        let tensors = model.encode_images_from_bytes(&[img_bytes.as_slice()])?;
+    let mut all = Vec::with_capacity(images.len());
+    for chunk in images.chunks(image_batch) {
+        let refs: Vec<&[u8]> = chunk.iter().map(|v| v.as_slice()).collect();
+        let tensors = model.encode_images_from_bytes(&refs)?;
         for t in &tensors {
             all.push(tensor_to_page_embedding(t)?);
         }
@@ -193,8 +221,9 @@ fn encode_query(
 // ── Score function (runs on tokio blocking pool, no model dependency) ──
 
 fn page_embedding_to_tensor(emb: &PageEmbedding, device: &Device) -> Result<Tensor> {
-    Ok(Tensor::from_vec(
-        emb.data.clone(),
+    // from_slice copies straight into tensor storage — no intermediate Vec clone.
+    Ok(Tensor::from_slice(
+        &emb.data,
         (emb.seq_len, emb.dims),
         device,
     )?)
@@ -231,11 +260,17 @@ fn score_on_device(
 }
 
 // ── Serialization for MinIO storage ──────────────────────────────────
+// CPU-bound: callers must run these on the blocking pool (spawn_blocking),
+// never directly on an async worker.
 
 /// Serialize page embeddings to raw bytes as bf16:
 /// [num_pages(u32), then for each page: seq_len(u32), dims(u32), bf16 data...]
 pub fn serialize_embeddings(embeddings: &[PageEmbedding]) -> Vec<u8> {
-    let mut buf = Vec::new();
+    let total: usize = 4 + embeddings
+        .iter()
+        .map(|e| 8 + e.data.len() * 2)
+        .sum::<usize>();
+    let mut buf = Vec::with_capacity(total);
     buf.extend_from_slice(&(embeddings.len() as u32).to_le_bytes());
     for emb in embeddings {
         buf.extend_from_slice(&(emb.seq_len as u32).to_le_bytes());
@@ -273,12 +308,14 @@ pub fn deserialize_embeddings(data: &[u8]) -> Result<Vec<PageEmbedding>> {
             anyhow::bail!("Unexpected end of embeddings data");
         }
 
+        // bf16 bits are the top 16 bits of the equivalent f32 — a shift is the
+        // exact conversion, ~memcpy speed vs per-value half decoding.
         let mut float_data = Vec::with_capacity(num_values);
-        for i in 0..num_values {
-            let offset = cursor + i * 2;
-            let val = half::bf16::from_le_bytes(data[offset..offset + 2].try_into()?);
-            float_data.push(val.to_f32());
-        }
+        float_data.extend(
+            data[cursor..cursor + byte_len]
+                .chunks_exact(2)
+                .map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16)),
+        );
         cursor += byte_len;
 
         embeddings.push(PageEmbedding {
@@ -289,4 +326,44 @@ pub fn deserialize_embeddings(data: &[u8]) -> Result<Vec<PageEmbedding>> {
     }
 
     Ok(embeddings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serialize_deserialize_roundtrip_matches_bf16() {
+        let values: Vec<f32> = vec![
+            0.0, -0.0, 1.0, -1.0, 0.123456, -3.14159, 1e-20, -1e-20, 65504.0, 1e30, -1e30,
+            f32::MIN_POSITIVE, 0.999999,
+        ];
+        let page = PageEmbedding {
+            seq_len: values.len(),
+            dims: 1,
+            data: values.clone(),
+        };
+        let raw = serialize_embeddings(&[page]);
+        let out = deserialize_embeddings(&raw).unwrap();
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].seq_len, values.len());
+        assert_eq!(out[0].dims, 1);
+        for (orig, got) in values.iter().zip(out[0].data.iter()) {
+            // The shift-based decode must agree exactly with the half crate.
+            let expected = half::bf16::from_f32(*orig).to_f32();
+            assert_eq!(expected.to_bits(), got.to_bits(), "value {}", orig);
+        }
+    }
+
+    #[test]
+    fn deserialize_rejects_truncated_data() {
+        let page = PageEmbedding {
+            seq_len: 4,
+            dims: 2,
+            data: vec![1.0; 8],
+        };
+        let raw = serialize_embeddings(&[page]);
+        assert!(deserialize_embeddings(&raw[..raw.len() - 3]).is_err());
+    }
 }

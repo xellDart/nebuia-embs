@@ -1,7 +1,7 @@
 use sqlx::postgres::PgPool;
 use sqlx::FromRow;
 
-#[derive(Debug, FromRow)]
+#[derive(Debug, Clone, FromRow)]
 pub struct Document {
     pub id: String,
     pub filename: String,
@@ -9,7 +9,7 @@ pub struct Document {
     pub status: String,
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Debug, Clone, FromRow)]
 pub struct Page {
     pub id: String,
     pub document_id: String,

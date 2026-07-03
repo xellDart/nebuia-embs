@@ -81,15 +81,21 @@ async fn main() -> Result<()> {
     let use_cpu = std::env::var("MODEL_DEVICE")
         .map(|d| d == "cpu")
         .unwrap_or(false);
+    let image_batch = if config.batch_image_encode {
+        config.batch_image_encode_size.max(1)
+    } else {
+        1
+    };
     let embedding = EmbeddingService::spawn(
         &config.model_path,
         use_cpu,
         config.use_bf16,
         config.model_dims,
         config.model_queue_capacity,
+        image_batch,
     )?;
 
-    let cache = CacheService::new(config.cache_max_size, config.cache_expiry_hours);
+    let cache = CacheService::new(config.cache_max_mb, config.cache_expiry_hours);
 
     let state = Arc::new(AppState {
         config: config.clone(),

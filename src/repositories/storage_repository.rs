@@ -157,17 +157,15 @@ impl StorageRepository {
         Ok(keys)
     }
 
-    pub async fn upload_embeddings(
+    /// Upload an already-compressed embeddings blob. Compression happens on the
+    /// caller's side (on the blocking pool — it's CPU-bound).
+    pub async fn upload_embeddings_compressed(
         &self,
         document_id: &str,
-        data: &[u8],
+        compressed: Vec<u8>,
+        original_size: usize,
     ) -> Result<String> {
         let object_name = format!("{}_embeddings.zst", document_id);
-
-        let compressed = zstd::encode_all(data, 3)
-            .context("Failed to compress embeddings")?;
-
-        let original_size = data.len();
         let compressed_size = compressed.len();
 
         self.client
@@ -204,7 +202,10 @@ impl StorageRepository {
             .await
             {
                 Ok(r) => r,
-                Err(_) => Err(anyhow::anyhow!("timed out after {}s", ATTEMPT_TIMEOUT.as_secs())),
+                Err(_) => Err(anyhow::anyhow!(
+                    "timed out after {}s",
+                    EMBEDDINGS_ATTEMPT_TIMEOUT.as_secs()
+                )),
             };
             match res {
                 Ok(data) => return Ok(data),
@@ -242,8 +243,12 @@ impl StorageRepository {
             .context("Failed to read embeddings body")?
             .into_bytes();
 
-        let decompressed = zstd::decode_all(compressed.as_ref())
-            .context("Failed to decompress embeddings")?;
+        // zstd decode of a large blob is CPU-bound; keep it off async workers.
+        let decompressed = tokio::task::spawn_blocking(move || {
+            zstd::decode_all(compressed.as_ref())
+        })
+        .await?
+        .context("Failed to decompress embeddings")?;
 
         Ok(decompressed)
     }

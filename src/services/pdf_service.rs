@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::Result;
 use futures_util::stream::{self, StreamExt};
 use tracing::{error, info, warn};
@@ -8,7 +11,14 @@ use crate::services::embedding_service::{
     deserialize_embeddings, serialize_embeddings, EmbeddingService, PageEmbedding,
 };
 
-/// Process embeddings for a document: download images → encode → compress → upload → save DB.
+/// Attempts for the background embeddings upload (each attempt already carries
+/// the SDK's own transient-failure retries), with linear backoff between them.
+const UPLOAD_ATTEMPTS: u32 = 5;
+const UPLOAD_BACKOFF: Duration = Duration::from_secs(10);
+
+/// Process embeddings for a document: download images → encode → save DB →
+/// warm cache → mark complete. Serialization + upload to storage happen in a
+/// background task so the document is searchable as soon as encoding is done.
 pub async fn process_document_embeddings(
     document_id: &str,
     pool: &sqlx::PgPool,
@@ -24,16 +34,28 @@ pub async fn process_document_embeddings(
         return Ok(());
     }
 
-    // Update status
+    // Update status and drop any stale cache from a previous version of this doc
     document_repository::update_document_status(pool, document_id, "processing").await?;
+    cache.remove(document_id).await;
 
     // Run the actual pipeline, catching errors to reset status
     match do_process(document_id, pool, storage, embedding, cache, batch_size).await {
-        Ok(()) => {
+        Ok(Some(embeddings)) => {
             document_repository::update_document_status(pool, document_id, "complete").await?;
-            info!("Embeddings complete for document {}", document_id);
+            info!(
+                "Embeddings complete for document {} (cache warm, upload in background)",
+                document_id
+            );
+            spawn_embeddings_upload(
+                document_id.to_string(),
+                embeddings,
+                pool.clone(),
+                storage.clone(),
+            );
             Ok(())
         }
+        // Document deleted mid-processing: nothing to save or upload.
+        Ok(None) => Ok(()),
         Err(e) => {
             error!("Processing failed for {}: {}", document_id, e);
             let _ = document_repository::update_document_status(pool, document_id, "error").await;
@@ -49,7 +71,7 @@ async fn do_process(
     embedding: &EmbeddingService,
     cache: &CacheService,
     batch_size: usize,
-) -> Result<()> {
+) -> Result<Option<Arc<Vec<PageEmbedding>>>> {
     // List page images from storage
     let prefix = format!("{}_page_", document_id);
     let mut page_objects: Vec<String> = storage
@@ -118,7 +140,7 @@ async fn do_process(
             "Document {} was deleted during processing, skipping save",
             document_id
         );
-        return Ok(());
+        return Ok(None);
     }
 
     // Save page metadata to DB (batch insert)
@@ -126,14 +148,88 @@ async fn do_process(
     let image_paths: Vec<&str> = page_objects.iter().map(|s| s.as_str()).collect();
     document_repository::save_pages_batch(pool, document_id, &page_numbers, &image_paths).await?;
 
-    // Serialize and upload embeddings (bf16 format)
-    let raw = serialize_embeddings(&all_embeddings);
-    storage.upload_embeddings(document_id, &raw).await?;
+    // Warm cache — searches are served from here while the upload runs.
+    let embeddings = Arc::new(all_embeddings);
+    cache.put(document_id, embeddings.clone()).await;
 
-    // Warm cache
-    cache.put(document_id, all_embeddings).await;
+    Ok(Some(embeddings))
+}
 
-    Ok(())
+/// Serialize + compress + upload embeddings off the critical path. On repeated
+/// failure the document is flipped to `error` so it gets reprocessed instead of
+/// staying `complete` with no durable embeddings behind the cache.
+fn spawn_embeddings_upload(
+    document_id: String,
+    embeddings: Arc<Vec<PageEmbedding>>,
+    pool: sqlx::PgPool,
+    storage: StorageRepository,
+) {
+    tokio::spawn(async move {
+        // bf16 conversion + zstd are CPU-bound: keep them off async workers.
+        let compressed = tokio::task::spawn_blocking(move || {
+            let raw = serialize_embeddings(&embeddings);
+            let original_size = raw.len();
+            zstd::encode_all(&raw[..], 3).map(|c| (c, original_size))
+        })
+        .await;
+        let (compressed, original_size) = match compressed {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => {
+                error!("Failed to compress embeddings for {}: {}", document_id, e);
+                let _ =
+                    document_repository::update_document_status(&pool, &document_id, "error").await;
+                return;
+            }
+            Err(e) => {
+                error!("Serialize task panicked for {}: {}", document_id, e);
+                let _ =
+                    document_repository::update_document_status(&pool, &document_id, "error").await;
+                return;
+            }
+        };
+
+        let mut last_err = None;
+        for attempt in 1..=UPLOAD_ATTEMPTS {
+            match storage
+                .upload_embeddings_compressed(&document_id, compressed.clone(), original_size)
+                .await
+            {
+                Ok(_) => {
+                    // The document may have been deleted while we were uploading;
+                    // don't leave an orphan blob behind.
+                    match document_repository::get_document(&pool, &document_id).await {
+                        Ok(None) => {
+                            info!(
+                                "Document {} deleted during upload, removing embeddings blob",
+                                document_id
+                            );
+                            let emb_key = format!("{}_embeddings.zst", document_id);
+                            let _ = storage.delete_objects(&[emb_key]).await;
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        "Embeddings upload for {} attempt {}/{} failed: {}",
+                        document_id, attempt, UPLOAD_ATTEMPTS, e
+                    );
+                    last_err = Some(e);
+                    if attempt < UPLOAD_ATTEMPTS {
+                        tokio::time::sleep(UPLOAD_BACKOFF * attempt).await;
+                    }
+                }
+            }
+        }
+
+        error!(
+            "Embeddings upload permanently failed for {}: {} — marking document as error",
+            document_id,
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        );
+        let _ = document_repository::update_document_status(&pool, &document_id, "error").await;
+    });
 }
 
 /// Search document pages by query.
@@ -147,10 +243,23 @@ pub async fn search_document(
     embedding: &EmbeddingService,
     cache: &CacheService,
 ) -> Result<Vec<String>> {
-    // Get document + pages
-    let (doc, pages) = document_repository::get_document_with_pages(pool, document_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Document {} not found", document_id))?;
+    // Get document + pages, served from the short-TTL meta cache when possible
+    // so repeated searches skip the two Postgres roundtrips.
+    let meta = match cache.get_meta(document_id).await {
+        Some(m) => m,
+        None => {
+            let (doc, pages) = document_repository::get_document_with_pages(pool, document_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Document {} not found", document_id))?;
+            let meta = Arc::new((doc, pages));
+            // Only completed documents are immutable enough to cache.
+            if meta.0.status == "complete" {
+                cache.put_meta(document_id, meta.clone()).await;
+            }
+            meta
+        }
+    };
+    let (doc, pages) = (&meta.0, &meta.1);
 
     if doc.status != "complete" {
         anyhow::bail!("Document {} is not ready (status: {})", document_id, doc.status);
@@ -162,19 +271,19 @@ pub async fn search_document(
 
     // Get stored embeddings — singleflight: N concurrent searches for the same
     // document_id collapse to ONE storage download + deserialize.
-    let page_embs_arc = cache
+    let page_embs = cache
         .try_get_or_fetch(document_id, || async {
             info!("Cache miss for {}, downloading from storage", document_id);
             let raw = storage.get_embeddings(document_id).await?;
-            deserialize_embeddings(&raw)
+            // Deserialization is CPU-bound; keep it off the async worker.
+            tokio::task::spawn_blocking(move || deserialize_embeddings(&raw)).await?
         })
         .await?;
-    let page_embs = page_embs_arc.as_ref().clone();
 
-    // Encode query
+    // Encode query (prioritized lane — does not wait behind document encodes)
     let query_embs = embedding.encode_query(query.to_string()).await?;
 
-    // Score
+    // Score straight from the cached Arc — no deep copy per search.
     let scores = embedding.score(query_embs, page_embs).await?;
 
     // Build results
@@ -240,7 +349,7 @@ pub async fn delete_document(
     let emb_key = format!("{}_embeddings.zst", document_id);
     storage.delete_objects(&[emb_key]).await?;
 
-    // Clear cache
+    // Clear cache (embeddings + metadata)
     cache.remove(document_id).await;
 
     // Delete from DB (pages cascade-delete via FK)

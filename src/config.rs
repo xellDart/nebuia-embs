@@ -14,7 +14,13 @@ pub struct AppConfig {
     /// Max in-flight encode requests queued for the model thread.
     /// When full, callers (HTTP/NATS) await on send → backpressure.
     pub model_queue_capacity: usize,
-    pub cache_max_size: u64,
+    /// Encode images in true model batches (batched vision forward) instead of
+    /// one at a time. Costs more VRAM per forward.
+    pub batch_image_encode: bool,
+    /// Images per model forward when `batch_image_encode` is on.
+    pub batch_image_encode_size: usize,
+    /// Embeddings cache budget in MB (weighed by actual embedding bytes).
+    pub cache_max_mb: u64,
     pub cache_expiry_hours: u64,
     pub nats_url: String,
     pub nats_enabled: bool,
@@ -39,7 +45,11 @@ impl AppConfig {
             model_queue_capacity: get("MODEL_QUEUE_CAPACITY", Some("8"))
                 .parse()
                 .unwrap_or(8),
-            cache_max_size: get("CACHE_MAX_SIZE", Some("10")).parse().unwrap_or(10),
+            batch_image_encode: get("BATCH_IMAGE_ENCODE", Some("false")) == "true",
+            batch_image_encode_size: get("BATCH_IMAGE_ENCODE_SIZE", Some("4"))
+                .parse()
+                .unwrap_or(4),
+            cache_max_mb: get("CACHE_MAX_MB", Some("4096")).parse().unwrap_or(4096),
             cache_expiry_hours: get("CACHE_EXPIRY_HOURS", Some("24")).parse().unwrap_or(24),
             nats_url: get("NATS_URL", Some("nats://localhost:4222")),
             nats_enabled: get("NATS_ENABLED", Some("true")) == "true",
