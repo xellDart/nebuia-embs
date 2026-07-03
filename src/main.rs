@@ -82,6 +82,14 @@ async fn main() -> Result<()> {
         .map(|d| d == "cpu")
         .unwrap_or(false);
     let image_batch = if config.batch_image_encode {
+        // crane's vision attention has no block-diagonal (cu_seqlens) mask yet:
+        // patches from different pages cross-attend when batched, changing the
+        // embeddings. Keep this off until crane grows varlen masking.
+        tracing::warn!(
+            "BATCH_IMAGE_ENCODE=true: crane-core vision attention lacks per-image \
+             masking; batched pages cross-attend and embeddings will differ from \
+             single-image encoding. Not recommended for production."
+        );
         config.batch_image_encode_size.max(1)
     } else {
         1
