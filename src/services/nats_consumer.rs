@@ -166,6 +166,7 @@ async fn process_message(
 
     let processing = crate::services::pdf_service::process_document_embeddings(
         &document_id,
+        &state.config.node_id,
         &state.db_pool,
         &state.storage,
         &state.embedding,

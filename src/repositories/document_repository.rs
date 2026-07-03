@@ -23,6 +23,28 @@ pub async fn update_document_status(
     Ok(result.rows_affected() > 0)
 }
 
+/// Mark a document complete, recording which node processed it and how long
+/// the pipeline took (list → download → encode → save, excludes the
+/// background upload).
+pub async fn mark_document_complete(
+    pool: &PgPool,
+    document_id: &str,
+    node_id: &str,
+    processing_secs: f64,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE documents
+         SET status = 'complete', processed_by = $1, processed_at = now(), processing_secs = $2
+         WHERE id = $3",
+    )
+    .bind(node_id)
+    .bind(processing_secs)
+    .bind(document_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn get_document_with_pages(
     pool: &PgPool,
     document_id: &str,

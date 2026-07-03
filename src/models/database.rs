@@ -41,6 +41,15 @@ pub async fn create_tables(pool: &PgPool) -> sqlx::Result<()> {
     .execute(pool)
     .await?;
 
+    // Processing provenance: which node produced the embeddings and how long it took
+    for ddl in [
+        "ALTER TABLE documents ADD COLUMN IF NOT EXISTS processed_by TEXT",
+        "ALTER TABLE documents ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ",
+        "ALTER TABLE documents ADD COLUMN IF NOT EXISTS processing_secs DOUBLE PRECISION",
+    ] {
+        sqlx::query(ddl).execute(pool).await?;
+    }
+
     // Ensure unique constraint exists for upsert support
     sqlx::query(
         r#"

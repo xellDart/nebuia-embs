@@ -21,12 +21,15 @@ const UPLOAD_BACKOFF: Duration = Duration::from_secs(10);
 /// background task so the document is searchable as soon as encoding is done.
 pub async fn process_document_embeddings(
     document_id: &str,
+    node_id: &str,
     pool: &sqlx::PgPool,
     storage: &StorageRepository,
     embedding: &EmbeddingService,
     cache: &CacheService,
     batch_size: usize,
 ) -> Result<()> {
+    let started = std::time::Instant::now();
+
     // Verify document exists
     let doc = document_repository::get_document(pool, document_id).await?;
     if doc.is_none() {
@@ -41,10 +44,17 @@ pub async fn process_document_embeddings(
     // Run the actual pipeline, catching errors to reset status
     match do_process(document_id, pool, storage, embedding, cache, batch_size).await {
         Ok(Some(embeddings)) => {
-            document_repository::update_document_status(pool, document_id, "complete").await?;
+            let processing_secs = started.elapsed().as_secs_f64();
+            document_repository::mark_document_complete(
+                pool,
+                document_id,
+                node_id,
+                processing_secs,
+            )
+            .await?;
             info!(
-                "Embeddings complete for document {} (cache warm, upload in background)",
-                document_id
+                "Embeddings complete for document {} in {:.1}s on node {} (cache warm, upload in background)",
+                document_id, processing_secs, node_id
             );
             spawn_embeddings_upload(
                 document_id.to_string(),

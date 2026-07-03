@@ -90,6 +90,7 @@ pub async fn process_pdf(
         let _permit = state_clone.process_semaphore.clone().acquire_owned().await;
         if let Err(e) = pdf_service::process_document_embeddings(
             &doc_id,
+            &state_clone.config.node_id,
             &state_clone.db_pool,
             &state_clone.storage,
             &state_clone.embedding,

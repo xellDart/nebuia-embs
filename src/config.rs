@@ -26,6 +26,9 @@ pub struct AppConfig {
     pub nats_enabled: bool,
     pub host: String,
     pub port: u16,
+    /// Identity recorded in `documents.processed_by` for every document this
+    /// instance processes. Defaults to the machine hostname.
+    pub node_id: String,
 }
 
 impl AppConfig {
@@ -53,6 +56,10 @@ impl AppConfig {
             nats_enabled: get("NATS_ENABLED", Some("true")) == "true",
             host: get("HOST", Some("0.0.0.0")),
             port: get("PORT", Some("8000")).parse().unwrap_or(8000),
+            node_id: env::var("NODE_ID")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(crate::services::db_janitor::hostname),
         }
     }
 }

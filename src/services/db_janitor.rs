@@ -10,7 +10,7 @@ pub fn instance_app_name() -> String {
 /// Capped so the full application_name stays under Postgres' 63-byte limit —
 /// otherwise truncation would desync our `<>` self-check and we could kill our
 /// own connections.
-fn hostname() -> String {
+pub fn hostname() -> String {
     let h = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .or_else(|_| std::fs::read_to_string("/etc/hostname"))
         .ok()
