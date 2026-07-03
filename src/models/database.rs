@@ -1,18 +1,15 @@
 use sqlx::postgres::PgPool;
 use sqlx::FromRow;
 
+// Row models: only the columns the service actually reads. The full table
+// schemas live in create_tables() below; sqlx ignores unselected extra columns.
 #[derive(Debug, Clone, FromRow)]
 pub struct Document {
-    pub id: String,
-    pub filename: String,
-    pub upload_date: String,
     pub status: String,
 }
 
 #[derive(Debug, Clone, FromRow)]
 pub struct Page {
-    pub id: String,
-    pub document_id: String,
     pub page_number: i32,
     pub image_path: String,
 }

@@ -26,8 +26,6 @@ pub struct AppConfig {
     pub nats_enabled: bool,
     pub host: String,
     pub port: u16,
-    pub max_retries: usize,
-    pub retry_delay_secs: u64,
 }
 
 impl AppConfig {
@@ -55,8 +53,6 @@ impl AppConfig {
             nats_enabled: get("NATS_ENABLED", Some("true")) == "true",
             host: get("HOST", Some("0.0.0.0")),
             port: get("PORT", Some("8000")).parse().unwrap_or(8000),
-            max_retries: get("MAX_RETRIES", Some("5")).parse().unwrap_or(5),
-            retry_delay_secs: get("RETRY_DELAY", Some("3")).parse().unwrap_or(3),
         }
     }
 }

@@ -45,10 +45,6 @@ impl CacheService {
         Self { embeddings, meta }
     }
 
-    pub async fn get(&self, document_id: &str) -> Option<Arc<Vec<PageEmbedding>>> {
-        self.embeddings.get(document_id).await
-    }
-
     pub async fn put(&self, document_id: &str, embeddings: Arc<Vec<PageEmbedding>>) {
         self.embeddings
             .insert(document_id.to_string(), embeddings)

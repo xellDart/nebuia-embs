@@ -171,11 +171,6 @@ impl EmbeddingService {
     pub fn is_alive(&self) -> bool {
         !self.images_tx.is_closed()
     }
-
-    /// Approximate number of slots free in the image-encode queue (for metrics).
-    pub fn encode_capacity_available(&self) -> usize {
-        self.images_tx.capacity()
-    }
 }
 
 // ── Model-thread functions (sync, run on the model thread) ──────────
