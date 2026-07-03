@@ -59,6 +59,7 @@ pub async fn run(
     queries: Vec<String>,
     dir: String,
     tol: f32,
+    image_batch: usize,
 ) -> Result<()> {
     let storage = StorageRepository::new(&config).await?;
 
@@ -92,7 +93,7 @@ pub async fn run(
         config.use_bf16,
         config.model_dims,
         config.model_queue_capacity,
-        1,
+        image_batch.max(1),
     )?;
 
     let started = std::time::Instant::now();

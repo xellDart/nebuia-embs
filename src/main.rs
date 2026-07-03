@@ -48,6 +48,9 @@ enum Cmd {
         /// Max allowed |Δ| per embedding value when comparing (0 = bit-exact)
         #[arg(long, default_value_t = 0.0)]
         tol: f32,
+        /// Images per encode call (1 = production default path)
+        #[arg(long, default_value_t = 1)]
+        image_batch: usize,
     },
 }
 
@@ -69,9 +72,11 @@ async fn main() -> Result<()> {
         queries,
         dir,
         tol,
+        image_batch,
     }) = args.cmd
     {
-        return services::regression::run(config, doc, record, queries, dir, tol).await;
+        return services::regression::run(config, doc, record, queries, dir, tol, image_batch)
+            .await;
     }
 
     info!("Connecting to database...");
@@ -117,15 +122,10 @@ async fn main() -> Result<()> {
     let use_cpu = std::env::var("MODEL_DEVICE")
         .map(|d| d == "cpu")
         .unwrap_or(false);
+    // With multiple images per call, crane decodes/resizes them in parallel on
+    // the CPU pool while keeping vision forwards strictly per-image, so results
+    // are bit-identical to one-at-a-time encoding (regression-verified).
     let image_batch = if config.batch_image_encode {
-        // crane's vision attention has no block-diagonal (cu_seqlens) mask yet:
-        // patches from different pages cross-attend when batched, changing the
-        // embeddings. Keep this off until crane grows varlen masking.
-        tracing::warn!(
-            "BATCH_IMAGE_ENCODE=true: crane-core vision attention lacks per-image \
-             masking; batched pages cross-attend and embeddings will differ from \
-             single-image encoding. Not recommended for production."
-        );
         config.batch_image_encode_size.max(1)
     } else {
         1
