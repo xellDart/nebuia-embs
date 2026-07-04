@@ -96,6 +96,10 @@ pub async fn run(
         image_batch.max(1),
     )?;
 
+    // Warmup: blocks until the model finishes loading (and JITs the first
+    // kernels) so the encode timing below measures encode work only.
+    let _ = embedding.encode_query("warmup".to_string()).await?;
+
     let started = std::time::Instant::now();
     let page_embs = embedding.encode_images_from_bytes(images).await?;
     println!(

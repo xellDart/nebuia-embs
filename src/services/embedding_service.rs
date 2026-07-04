@@ -204,13 +204,26 @@ fn encode_images_from_bytes(
     images: &[Vec<u8>],
     image_batch: usize,
 ) -> Result<Vec<PageEmbedding>> {
+    let profile = std::env::var("CRANE_PROFILE").map(|v| v == "1").unwrap_or(false);
     let mut all = Vec::with_capacity(images.len());
+    let (mut t_model, mut t_convert) = (0f64, 0f64);
     for chunk in images.chunks(image_batch) {
         let refs: Vec<&[u8]> = chunk.iter().map(|v| v.as_slice()).collect();
+        let t0 = std::time::Instant::now();
         let tensors = model.encode_images_from_bytes(&refs)?;
+        let t1 = std::time::Instant::now();
         for t in &tensors {
             all.push(tensor_to_page_embedding(t)?);
         }
+        t_model += t1.duration_since(t0).as_secs_f64();
+        t_convert += t1.elapsed().as_secs_f64();
+    }
+    if profile {
+        tracing::info!(
+            "encode profile: crane {:.0}ms, tensor->PageEmbedding {:.0}ms",
+            t_model * 1e3,
+            t_convert * 1e3
+        );
     }
     Ok(all)
 }
