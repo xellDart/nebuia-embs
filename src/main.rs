@@ -137,6 +137,9 @@ async fn main() -> Result<()> {
         config.model_dims,
         config.model_queue_capacity,
         image_batch,
+        config.search_score_concurrency,
+        config.gpu_cache_mb,
+        config.gpu_cache_idle_secs,
     )?;
 
     let cache = CacheService::new(config.cache_max_mb, config.cache_expiry_hours);

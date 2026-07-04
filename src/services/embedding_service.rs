@@ -1,7 +1,8 @@
 use anyhow::Result;
 use candle_core::{Device, Tensor};
-use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{error, info};
 
 /// Serialized embedding: list of pages, each page is (seq_len, dims) flattened.
@@ -16,6 +17,72 @@ pub struct PageEmbedding {
     pub seq_len: usize,
     pub dims: usize,
     pub data: Vec<half::bf16>,
+}
+
+/// One document's page embeddings resident on the GPU as ready-to-score f32
+/// tensors. `bytes` is the device footprint used for budget accounting.
+struct GpuCacheEntry {
+    doc_id: String,
+    tensors: Arc<Vec<Tensor>>,
+    bytes: u64,
+    last_used: Instant,
+}
+
+/// LRU cache of documents' page tensors in VRAM, bounded by a byte budget and
+/// an idle TTL. The typical workload is a burst of ~20-30 searches right after
+/// a document is ingested and almost nothing later, so entries live minutes,
+/// not hours. VRAM is the scarcest resource on the box: the budget must stay
+/// small enough that the encoder's peak allocations are never squeezed.
+struct GpuDocCache {
+    entries: Vec<GpuCacheEntry>,
+    budget_bytes: u64,
+    idle: Duration,
+}
+
+impl GpuDocCache {
+    fn get(&mut self, doc_id: &str) -> Option<Arc<Vec<Tensor>>> {
+        self.evict_expired();
+        let e = self.entries.iter_mut().find(|e| e.doc_id == doc_id)?;
+        e.last_used = Instant::now();
+        Some(e.tensors.clone())
+    }
+
+    fn insert(&mut self, doc_id: String, tensors: Arc<Vec<Tensor>>, bytes: u64) {
+        // A document bigger than the whole budget is never cached.
+        if bytes > self.budget_bytes {
+            return;
+        }
+        self.entries.retain(|e| e.doc_id != doc_id);
+        let mut used: u64 = self.entries.iter().map(|e| e.bytes).sum();
+        while used + bytes > self.budget_bytes {
+            let Some((idx, _)) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.last_used)
+            else {
+                break;
+            };
+            used -= self.entries[idx].bytes;
+            self.entries.swap_remove(idx);
+        }
+        self.entries.push(GpuCacheEntry {
+            doc_id,
+            tensors,
+            bytes,
+            last_used: Instant::now(),
+        });
+    }
+
+    fn evict_expired(&mut self) {
+        let now = Instant::now();
+        self.entries
+            .retain(|e| now.duration_since(e.last_used) < self.idle);
+    }
+
+    fn invalidate(&mut self, doc_id: &str) {
+        self.entries.retain(|e| e.doc_id != doc_id);
+    }
 }
 
 struct ImagesRequest {
@@ -40,6 +107,12 @@ pub struct EmbeddingService {
     /// Device handle used by score() on a separate (blocking) task.
     /// Same physical GPU as the model; CUDA driver schedules concurrent kernels.
     device: Arc<Device>,
+    /// Caps concurrent score() calls. Each search holds its page tensors on
+    /// the GPU while scoring; unbounded concurrency OOMs the device (seen in
+    /// prod: 4 simultaneous searches on a 224-page document).
+    score_semaphore: Arc<Semaphore>,
+    /// VRAM-resident page tensors per document (None = disabled).
+    gpu_cache: Option<Arc<Mutex<GpuDocCache>>>,
 }
 
 impl EmbeddingService {
@@ -47,6 +120,9 @@ impl EmbeddingService {
     /// in-flight image-encode queue (caller `send().await` blocks when full).
     /// `image_batch` is how many images are encoded per model forward
     /// (1 = one at a time; >1 batches the vision tower, more VRAM).
+    /// `score_concurrency` caps simultaneous score() calls on the device.
+    /// `gpu_cache_mb` > 0 keeps recently-searched documents' page tensors
+    /// resident in VRAM up to that budget (0 = upload per search, as before).
     pub fn spawn(
         model_path: &str,
         use_cpu: bool,
@@ -54,6 +130,9 @@ impl EmbeddingService {
         target_dims: Option<usize>,
         queue_capacity: usize,
         image_batch: usize,
+        score_concurrency: usize,
+        gpu_cache_mb: u64,
+        gpu_cache_idle_secs: u64,
     ) -> Result<Self> {
         // Build the score-side device on the calling thread so we can hand it
         // back to the service immediately, even if the model thread is still loading.
@@ -125,15 +204,34 @@ impl EmbeddingService {
                 info!("Embedding model thread shutting down");
             })?;
 
+        let gpu_cache = (gpu_cache_mb > 0).then(|| {
+            info!(
+                "GPU doc cache enabled: {} MB budget, {}s idle TTL",
+                gpu_cache_mb, gpu_cache_idle_secs
+            );
+            Arc::new(Mutex::new(GpuDocCache {
+                entries: Vec::new(),
+                budget_bytes: gpu_cache_mb * 1024 * 1024,
+                idle: Duration::from_secs(gpu_cache_idle_secs),
+            }))
+        });
+
         Ok(Self {
             images_tx,
             query_tx,
             device,
+            score_semaphore: Arc::new(Semaphore::new(score_concurrency.max(1))),
+            gpu_cache,
         })
     }
 
     /// Submit images for encoding. **Awaits** if the queue is full → backpressure.
     pub async fn encode_images_from_bytes(&self, images: Vec<Vec<u8>>) -> Result<Vec<PageEmbedding>> {
+        // Give the encoder its VRAM back: drop cached docs nobody searched
+        // recently before the next multi-image forward allocates its peak.
+        if let Some(cache) = &self.gpu_cache {
+            cache.lock().unwrap().evict_expired();
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         self.images_tx
             .send(ImagesRequest {
@@ -158,19 +256,85 @@ impl EmbeddingService {
         reply_rx.await?
     }
 
-    /// Score query embeddings against page embeddings.
+    /// Score query embeddings against a document's page embeddings.
     ///
     /// Runs on the tokio blocking pool, NOT on the model thread — so a search
     /// request never queues behind a long-running document encode.
     /// Takes the cached pages by Arc: no deep copy of the embeddings.
+    /// With the GPU cache enabled, the document's page tensors are reused
+    /// across searches instead of being re-uploaded each time.
     pub async fn score(
         &self,
+        document_id: &str,
         query_embs: Vec<PageEmbedding>,
         page_embs: Arc<Vec<PageEmbedding>>,
     ) -> Result<Vec<f32>> {
+        let _permit = self.score_semaphore.clone().acquire_owned().await?;
         let device = self.device.clone();
-        tokio::task::spawn_blocking(move || score_on_device(&device, &query_embs, &page_embs))
-            .await?
+        let gpu_cache = self.gpu_cache.clone();
+        let doc_id = document_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let cached = gpu_cache.as_ref().and_then(|c| c.lock().unwrap().get(&doc_id));
+            let ps = match cached {
+                Some(t) => t,
+                None => {
+                    // Two concurrent misses on the same doc build twice; the
+                    // semaphore bounds that transient, so no lock across upload.
+                    let tensors: Vec<Tensor> = page_embs
+                        .iter()
+                        .map(|e| page_embedding_to_tensor(e, &device))
+                        .collect::<Result<_>>()?;
+                    let tensors = Arc::new(tensors);
+                    if let Some(c) = &gpu_cache {
+                        // Resident as f32: 4 bytes per value.
+                        let bytes: u64 =
+                            page_embs.iter().map(|e| (e.data.len() * 4) as u64).sum();
+                        c.lock().unwrap().insert(doc_id, tensors.clone(), bytes);
+                    }
+                    tensors
+                }
+            };
+            score_on_device(&query_embs, &ps, &device)
+        })
+        .await?
+    }
+
+    /// Drop a document's tensors from the GPU cache (on delete/reprocess).
+    pub fn invalidate_gpu(&self, document_id: &str) {
+        if let Some(c) = &self.gpu_cache {
+            c.lock().unwrap().invalidate(document_id);
+        }
+    }
+
+    /// Pre-upload a document's page tensors right after ingest, so the search
+    /// burst that follows `complete` hits a warm cache instead of stampeding
+    /// cold misses. No-op when the cache is disabled or the doc doesn't fit.
+    pub async fn warm_gpu(
+        &self,
+        document_id: &str,
+        page_embs: Arc<Vec<PageEmbedding>>,
+    ) -> Result<()> {
+        let Some(cache) = self.gpu_cache.clone() else {
+            return Ok(());
+        };
+        // Warming is a device upload like any search miss: take a score
+        // permit so it can't stack on top of concurrent searches.
+        let _permit = self.score_semaphore.clone().acquire_owned().await?;
+        let device = self.device.clone();
+        let doc_id = document_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let bytes: u64 = page_embs.iter().map(|e| (e.data.len() * 4) as u64).sum();
+            if bytes > cache.lock().unwrap().budget_bytes {
+                return Ok(());
+            }
+            let tensors: Vec<Tensor> = page_embs
+                .iter()
+                .map(|e| page_embedding_to_tensor(e, &device))
+                .collect::<Result<_>>()?;
+            cache.lock().unwrap().insert(doc_id, Arc::new(tensors), bytes);
+            Ok(())
+        })
+        .await?
     }
 
     pub fn is_alive(&self) -> bool {
@@ -246,21 +410,16 @@ fn page_embedding_to_tensor(emb: &PageEmbedding, device: &Device) -> Result<Tens
 }
 
 fn score_on_device(
-    device: &Device,
     query_embs: &[PageEmbedding],
-    page_embs: &[PageEmbedding],
+    page_tensors: &[Tensor],
+    device: &Device,
 ) -> Result<Vec<f32>> {
     let qs: Vec<Tensor> = query_embs
         .iter()
         .map(|e| page_embedding_to_tensor(e, device))
         .collect::<Result<_>>()?;
 
-    let ps: Vec<Tensor> = page_embs
-        .iter()
-        .map(|e| page_embedding_to_tensor(e, device))
-        .collect::<Result<_>>()?;
-
-    let scores = crane_core::models::colqwen3_emb::ColQwen3Emb::score(&qs, &ps, 128)?;
+    let scores = crane_core::models::colqwen3_emb::ColQwen3Emb::score(&qs, page_tensors, 128)?;
     let scores_vec: Vec<f32> = scores.squeeze(0)?.to_vec1()?;
 
     let mut indexed: Vec<(usize, f32)> = scores_vec.iter().copied().enumerate().collect();

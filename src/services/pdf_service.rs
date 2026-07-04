@@ -40,10 +40,18 @@ pub async fn process_document_embeddings(
     // Update status and drop any stale cache from a previous version of this doc
     document_repository::update_document_status(pool, document_id, "processing").await?;
     cache.remove(document_id).await;
+    embedding.invalidate_gpu(document_id);
 
     // Run the actual pipeline, catching errors to reset status
     match do_process(document_id, pool, storage, embedding, cache, batch_size).await {
         Ok(Some(embeddings)) => {
+            // Warm the GPU cache BEFORE marking complete: `complete` is what
+            // triggers the downstream search burst, so by the time queries
+            // arrive the page tensors are already resident. Best-effort — a
+            // warm failure just means searches fall back to the cold path.
+            if let Err(e) = embedding.warm_gpu(document_id, embeddings.clone()).await {
+                warn!("GPU cache warm failed for {}: {}", document_id, e);
+            }
             let processing_secs = started.elapsed().as_secs_f64();
             document_repository::mark_document_complete(
                 pool,
@@ -294,7 +302,7 @@ pub async fn search_document(
     let query_embs = embedding.encode_query(query.to_string()).await?;
 
     // Score straight from the cached Arc — no deep copy per search.
-    let scores = embedding.score(query_embs, page_embs).await?;
+    let scores = embedding.score(document_id, query_embs, page_embs).await?;
 
     // Build results
     let mut indexed: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
@@ -348,6 +356,7 @@ pub async fn delete_document(
     pool: &sqlx::PgPool,
     storage: &StorageRepository,
     cache: &CacheService,
+    embedding: &EmbeddingService,
 ) -> Result<serde_json::Value> {
     let (_, pages) = document_repository::get_document_with_pages(pool, document_id)
         .await?
@@ -359,8 +368,9 @@ pub async fn delete_document(
     let emb_key = format!("{}_embeddings.zst", document_id);
     storage.delete_objects(&[emb_key]).await?;
 
-    // Clear cache (embeddings + metadata)
+    // Clear cache (embeddings + metadata + GPU-resident tensors)
     cache.remove(document_id).await;
+    embedding.invalidate_gpu(document_id);
 
     // Delete from DB (pages cascade-delete via FK)
     document_repository::delete_document(pool, document_id).await?;

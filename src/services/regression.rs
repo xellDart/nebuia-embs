@@ -87,6 +87,8 @@ pub async fn run(
 
     // ── Encode with the production path (image_batch = 1) ───────
     let use_cpu = std::env::var("MODEL_DEVICE").map(|d| d == "cpu").unwrap_or(false);
+    // GPU cache off (0 MB): the harness must measure the raw production
+    // score path, uploading tensors per query like a cache-cold search.
     let embedding = EmbeddingService::spawn(
         &config.model_path,
         use_cpu,
@@ -94,6 +96,9 @@ pub async fn run(
         config.model_dims,
         config.model_queue_capacity,
         image_batch.max(1),
+        1,
+        0,
+        config.gpu_cache_idle_secs,
     )?;
 
     // Warmup: blocks until the model finishes loading (and JITs the first
@@ -118,7 +123,9 @@ pub async fn run(
     let mut results: Vec<QueryResult> = Vec::new();
     for q in &query_list {
         let q_embs = embedding.encode_query(q.clone()).await?;
-        let scores = embedding.score(q_embs, page_embs_arc.clone()).await?;
+        let scores = embedding
+            .score(&document_id, q_embs, page_embs_arc.clone())
+            .await?;
         let mut ranking: Vec<usize> = (0..scores.len()).collect();
         ranking.sort_by(|&a, &b| {
             scores[b]

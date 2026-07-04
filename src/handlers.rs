@@ -153,6 +153,7 @@ pub async fn delete_document(
         &state.db_pool,
         &state.storage,
         &state.cache,
+        &state.embedding,
     )
     .await
     .map_err(|e| {

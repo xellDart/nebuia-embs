@@ -22,6 +22,14 @@ pub struct AppConfig {
     /// Embeddings cache budget in MB (weighed by actual embedding bytes).
     pub cache_max_mb: u64,
     pub cache_expiry_hours: u64,
+    /// Max concurrent score() calls on the GPU. Each search holds its page
+    /// tensors in VRAM while scoring; this caps the peak.
+    pub search_score_concurrency: usize,
+    /// VRAM budget (MB) for keeping recently-searched documents' page tensors
+    /// resident on the GPU. 0 = disabled (re-upload per search).
+    pub gpu_cache_mb: u64,
+    /// Idle seconds before a GPU-cached document is dropped.
+    pub gpu_cache_idle_secs: u64,
     pub nats_url: String,
     pub nats_enabled: bool,
     pub host: String,
@@ -52,6 +60,13 @@ impl AppConfig {
                 .unwrap_or(4),
             cache_max_mb: get("CACHE_MAX_MB", Some("4096")).parse().unwrap_or(4096),
             cache_expiry_hours: get("CACHE_EXPIRY_HOURS", Some("24")).parse().unwrap_or(24),
+            search_score_concurrency: get("SEARCH_SCORE_CONCURRENCY", Some("2"))
+                .parse()
+                .unwrap_or(2),
+            gpu_cache_mb: get("GPU_CACHE_MB", Some("0")).parse().unwrap_or(0),
+            gpu_cache_idle_secs: get("GPU_CACHE_IDLE_SECS", Some("300"))
+                .parse()
+                .unwrap_or(300),
             nats_url: get("NATS_URL", Some("nats://localhost:4222")),
             nats_enabled: get("NATS_ENABLED", Some("true")) == "true",
             host: get("HOST", Some("0.0.0.0")),
