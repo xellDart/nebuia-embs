@@ -60,6 +60,17 @@ pub async fn process_document_embeddings(
                 processing_secs,
             )
             .await?;
+            // Warm the meta cache too. `complete` triggers a burst of searches
+            // that would ALL miss the (non-singleflight) meta cache at once,
+            // stampeding the small DB pool — the 300-500ms `meta` spikes in the
+            // search timing logs. Populate it here from the canonical rows (now
+            // that status is `complete`) so the burst hits a warm meta cache.
+            // Best-effort: on failure searches fall back to the DB path.
+            match document_repository::get_document_with_pages(pool, document_id).await {
+                Ok(Some(meta)) => cache.put_meta(document_id, Arc::new(meta)).await,
+                Ok(None) => {}
+                Err(e) => warn!("Meta cache warm failed for {}: {}", document_id, e),
+            }
             info!(
                 "Embeddings complete for document {} in {:.1}s on node {} (cache warm, upload in background)",
                 document_id, processing_secs, node_id
