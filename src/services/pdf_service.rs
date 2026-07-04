@@ -261,6 +261,7 @@ pub async fn search_document(
     embedding: &EmbeddingService,
     cache: &CacheService,
 ) -> Result<Vec<String>> {
+    let t0 = std::time::Instant::now();
     // Get document + pages, served from the short-TTL meta cache when possible
     // so repeated searches skip the two Postgres roundtrips.
     let meta = match cache.get_meta(document_id).await {
@@ -287,8 +288,11 @@ pub async fn search_document(
         anyhow::bail!("No pages found for document {}", document_id);
     }
 
+    let meta_ms = t0.elapsed().as_millis();
+
     // Get stored embeddings — singleflight: N concurrent searches for the same
     // document_id collapse to ONE storage download + deserialize.
+    let t_embs = std::time::Instant::now();
     let page_embs = cache
         .try_get_or_fetch(document_id, || async {
             info!("Cache miss for {}, downloading from storage", document_id);
@@ -297,12 +301,28 @@ pub async fn search_document(
             tokio::task::spawn_blocking(move || deserialize_embeddings(&raw)).await?
         })
         .await?;
+    let embs_ms = t_embs.elapsed().as_millis();
 
     // Encode query (prioritized lane — does not wait behind document encodes)
+    let t_query = std::time::Instant::now();
     let query_embs = embedding.encode_query(query.to_string()).await?;
+    let query_ms = t_query.elapsed().as_millis();
 
     // Score straight from the cached Arc — no deep copy per search.
+    let t_score = std::time::Instant::now();
     let scores = embedding.score(document_id, query_embs, page_embs).await?;
+
+    info!(
+        "Search [{}]: total {}ms (meta {}ms, embs {}ms, query {}ms, score {}ms) k={} q=\"{}\"",
+        document_id,
+        t0.elapsed().as_millis(),
+        meta_ms,
+        embs_ms,
+        query_ms,
+        t_score.elapsed().as_millis(),
+        k,
+        query.chars().take(80).collect::<String>()
+    );
 
     // Build results
     let mut indexed: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();

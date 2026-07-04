@@ -19,11 +19,13 @@ pub struct PageEmbedding {
     pub data: Vec<half::bf16>,
 }
 
-/// One document's page embeddings resident on the GPU as ready-to-score f32
-/// tensors. `bytes` is the device footprint used for budget accounting.
+/// One document resident on the GPU as the pre-stacked, padded, transposed
+/// f32 tensor `score_stacked` consumes directly — cache hits skip both the
+/// PCIe upload AND the two full-document copies stacking allocates.
+/// `bytes` is the padded device footprint used for budget accounting.
 struct GpuCacheEntry {
     doc_id: String,
-    tensors: Arc<Vec<Tensor>>,
+    ps_t: Tensor,
     bytes: u64,
     last_used: Instant,
 }
@@ -40,16 +42,22 @@ struct GpuDocCache {
 }
 
 impl GpuDocCache {
-    fn get(&mut self, doc_id: &str) -> Option<Arc<Vec<Tensor>>> {
+    fn get(&mut self, doc_id: &str) -> Option<Tensor> {
         self.evict_expired();
         let e = self.entries.iter_mut().find(|e| e.doc_id == doc_id)?;
         e.last_used = Instant::now();
-        Some(e.tensors.clone())
+        Some(e.ps_t.clone())
     }
 
-    fn insert(&mut self, doc_id: String, tensors: Arc<Vec<Tensor>>, bytes: u64) {
+    fn insert(&mut self, doc_id: String, ps_t: Tensor, bytes: u64) {
         // A document bigger than the whole budget is never cached.
         if bytes > self.budget_bytes {
+            info!(
+                "GPU cache skip [{}]: {} MB > presupuesto {} MB, este doc siempre irá por el path frío",
+                doc_id,
+                bytes >> 20,
+                self.budget_bytes >> 20
+            );
             return;
         }
         self.entries.retain(|e| e.doc_id != doc_id);
@@ -63,21 +71,47 @@ impl GpuDocCache {
             else {
                 break;
             };
-            used -= self.entries[idx].bytes;
-            self.entries.swap_remove(idx);
+            let victim = self.entries.swap_remove(idx);
+            used -= victim.bytes;
+            info!(
+                "GPU cache evict [{}]: {} MB liberados (presión de presupuesto)",
+                victim.doc_id,
+                victim.bytes >> 20
+            );
         }
+        used += bytes;
+        let count = self.entries.len() + 1;
         self.entries.push(GpuCacheEntry {
-            doc_id,
-            tensors,
+            doc_id: doc_id.clone(),
+            ps_t,
             bytes,
             last_used: Instant::now(),
         });
+        info!(
+            "GPU cache insert [{}]: {} MB (uso {}/{} MB, {} docs)",
+            doc_id,
+            bytes >> 20,
+            used >> 20,
+            self.budget_bytes >> 20,
+            count
+        );
     }
 
     fn evict_expired(&mut self) {
         let now = Instant::now();
-        self.entries
-            .retain(|e| now.duration_since(e.last_used) < self.idle);
+        let idle = self.idle;
+        self.entries.retain(|e| {
+            let keep = now.duration_since(e.last_used) < idle;
+            if !keep {
+                info!(
+                    "GPU cache evict [{}]: {} MB liberados (idle > {}s)",
+                    e.doc_id,
+                    e.bytes >> 20,
+                    idle.as_secs()
+                );
+            }
+            keep
+        });
     }
 
     fn invalidate(&mut self, doc_id: &str) {
@@ -269,32 +303,35 @@ impl EmbeddingService {
         query_embs: Vec<PageEmbedding>,
         page_embs: Arc<Vec<PageEmbedding>>,
     ) -> Result<Vec<f32>> {
+        let t0 = Instant::now();
         let _permit = self.score_semaphore.clone().acquire_owned().await?;
+        let sem_ms = t0.elapsed().as_millis();
         let device = self.device.clone();
         let gpu_cache = self.gpu_cache.clone();
         let doc_id = document_id.to_string();
         tokio::task::spawn_blocking(move || {
             let cached = gpu_cache.as_ref().and_then(|c| c.lock().unwrap().get(&doc_id));
-            let ps = match cached {
+            let hit = cached.is_some();
+            let t_stack = Instant::now();
+            let ps_t = match cached {
                 Some(t) => t,
-                None => {
-                    // Two concurrent misses on the same doc build twice; the
-                    // semaphore bounds that transient, so no lock across upload.
-                    let tensors: Vec<Tensor> = page_embs
-                        .iter()
-                        .map(|e| page_embedding_to_tensor(e, &device))
-                        .collect::<Result<_>>()?;
-                    let tensors = Arc::new(tensors);
-                    if let Some(c) = &gpu_cache {
-                        // Resident as f32: 4 bytes per value.
-                        let bytes: u64 =
-                            page_embs.iter().map(|e| (e.data.len() * 4) as u64).sum();
-                        c.lock().unwrap().insert(doc_id, tensors.clone(), bytes);
-                    }
-                    tensors
-                }
+                // Two concurrent misses on the same doc build twice; the
+                // semaphore bounds that transient, so no lock across upload.
+                None => build_stacked(&device, &page_embs, gpu_cache.as_deref(), &doc_id)?,
             };
-            score_on_device(&query_embs, &ps, &device)
+            let stack_ms = t_stack.elapsed().as_millis();
+            let t_mm = Instant::now();
+            let result = score_stacked_on_device(&doc_id, &query_embs, &ps_t, &device);
+            info!(
+                "Score [{}]: {} págs, gpu {}, sem {}ms, stack {}ms, matmul {}ms",
+                doc_id,
+                page_embs.len(),
+                if hit { "HIT" } else { "MISS" },
+                sem_ms,
+                stack_ms,
+                t_mm.elapsed().as_millis()
+            );
+            result
         })
         .await?
     }
@@ -306,7 +343,7 @@ impl EmbeddingService {
         }
     }
 
-    /// Pre-upload a document's page tensors right after ingest, so the search
+    /// Pre-stack a document's page tensors right after ingest, so the search
     /// burst that follows `complete` hits a warm cache instead of stampeding
     /// cold misses. No-op when the cache is disabled or the doc doesn't fit.
     pub async fn warm_gpu(
@@ -323,15 +360,29 @@ impl EmbeddingService {
         let device = self.device.clone();
         let doc_id = document_id.to_string();
         tokio::task::spawn_blocking(move || {
-            let bytes: u64 = page_embs.iter().map(|e| (e.data.len() * 4) as u64).sum();
-            if bytes > cache.lock().unwrap().budget_bytes {
+            // Padded-size estimate BEFORE building: an oversized doc would be
+            // built only to be rejected — skip the transient entirely.
+            let max_sp = page_embs.iter().map(|e| e.seq_len).max().unwrap_or(0);
+            let dims = page_embs.first().map(|e| e.dims).unwrap_or(0);
+            let est = (page_embs.len() * max_sp * dims * 4) as u64;
+            if est > cache.lock().unwrap().budget_bytes {
+                info!(
+                    "GPU cache warm skip [{}]: ~{} MB padded excede el presupuesto",
+                    doc_id,
+                    est >> 20
+                );
                 return Ok(());
             }
-            let tensors: Vec<Tensor> = page_embs
-                .iter()
-                .map(|e| page_embedding_to_tensor(e, &device))
-                .collect::<Result<_>>()?;
-            cache.lock().unwrap().insert(doc_id, Arc::new(tensors), bytes);
+            let t0 = Instant::now();
+            let pages = page_embs.len();
+            let ps_t = build_stacked(&device, &page_embs, Some(cache.as_ref()), &doc_id)?;
+            info!(
+                "GPU cache warm [{}]: {} págs, {} MB, {}ms",
+                doc_id,
+                pages,
+                (ps_t.elem_count() * 4) >> 20,
+                t0.elapsed().as_millis()
+            );
             Ok(())
         })
         .await?
@@ -409,9 +460,33 @@ fn page_embedding_to_tensor(emb: &PageEmbedding, device: &Device) -> Result<Tens
         .to_dtype(candle_core::DType::F32)?)
 }
 
-fn score_on_device(
+/// Upload page embeddings and stack them into the (N, dims, max_sp) layout
+/// scoring consumes. The per-page tensors are transient: only the stacked
+/// tensor survives (and is inserted into the GPU cache when it fits).
+fn build_stacked(
+    device: &Device,
+    page_embs: &[PageEmbedding],
+    gpu_cache: Option<&Mutex<GpuDocCache>>,
+    doc_id: &str,
+) -> Result<Tensor> {
+    let pages: Vec<Tensor> = page_embs
+        .iter()
+        .map(|e| page_embedding_to_tensor(e, device))
+        .collect::<Result<_>>()?;
+    let ps_t = crane_core::models::colqwen3_emb::ColQwen3Emb::stack_passages(&pages)?;
+    drop(pages);
+    if let Some(c) = gpu_cache {
+        // f32 on device: 4 bytes per element, padded size.
+        let bytes = (ps_t.elem_count() * 4) as u64;
+        c.lock().unwrap().insert(doc_id.to_string(), ps_t.clone(), bytes);
+    }
+    Ok(ps_t)
+}
+
+fn score_stacked_on_device(
+    doc_id: &str,
     query_embs: &[PageEmbedding],
-    page_tensors: &[Tensor],
+    ps_t: &Tensor,
     device: &Device,
 ) -> Result<Vec<f32>> {
     let qs: Vec<Tensor> = query_embs
@@ -419,7 +494,7 @@ fn score_on_device(
         .map(|e| page_embedding_to_tensor(e, device))
         .collect::<Result<_>>()?;
 
-    let scores = crane_core::models::colqwen3_emb::ColQwen3Emb::score(&qs, page_tensors, 128)?;
+    let scores = crane_core::models::colqwen3_emb::ColQwen3Emb::score_stacked(&qs, ps_t, 128)?;
     let scores_vec: Vec<f32> = scores.squeeze(0)?.to_vec1()?;
 
     let mut indexed: Vec<(usize, f32)> = scores_vec.iter().copied().enumerate().collect();
@@ -429,7 +504,7 @@ fn score_on_device(
         .take(10)
         .map(|(i, s)| format!("p{}={:.1}", i, s))
         .collect();
-    info!("Scores top-10: {}", top.join(", "));
+    info!("Scores top-10 [{}]: {}", doc_id, top.join(", "));
 
     Ok(scores_vec)
 }

@@ -133,7 +133,9 @@ pub async fn search_document(
     )
     .await
     .map_err(|e| {
-        let msg = e.to_string();
+        // Node identity in the error body: the balancer sits behind one domain
+        // per node, but its logs need to say WHICH node failed and why.
+        let msg = format!("[{}] {}", state.config.node_id, e);
         if msg.contains("not found") {
             api_error(StatusCode::NOT_FOUND, msg)
         } else {
