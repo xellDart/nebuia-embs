@@ -8,9 +8,12 @@ Uses [crane-core](https://github.com/xellDart/Crane) as the inference backend fo
 
 - **ColQwen3 4B** multi-vector embeddings for document page images
 - **ColBERT MaxSim** late-interaction scoring for retrieval
+- **Single shared model, zero duplication** — [crane-core](https://github.com/xellDart/Crane) is linked in-process; **one** ColQwen3 instance is loaded **once** and drives both ingest (encode) and search (query)
+- **GPU-resident embedding cache** — hot documents keep a pre-stacked score tensor on the GPU, so search skips the re-upload and re-stack on every query
+- **Prioritized query lane** — interactive search preempts background ingest so query latency stays low under load
 - **Matryoshka dimension support** — configurable embedding dims (1280 / 2560)
 - **CUDA + Flash Attention** support with automatic detection
-- **BF16 inference** for reduced GPU memory
+- **BF16 inference** end-to-end for reduced GPU memory and faster encode
 - **S3-compatible storage** (MinIO, UpCloud, AWS S3) for images and embeddings
 - **NATS JetStream** consumer for async job processing
 - **LRU cache** with TTL for hot document embeddings
@@ -50,6 +53,26 @@ nebuia-embs/
 2. **Search**: On a `/simple/search/{id}?query=...` request, the service encodes the text query through the same model, loads the document's embeddings (from cache or S3), and scores each page using ColBERT MaxSim. Returns top-k page image paths ranked by relevance.
 
 3. **Model thread**: The ColQwen3 model runs on a dedicated `std::thread` (not async) with an `mpsc` channel interface. All GPU inference happens on this single thread, while the async runtime handles HTTP, S3, and DB concurrently.
+
+## Performance & Design
+
+The service is built around a few deliberate choices that keep both throughput (ingest) and latency (search) high on a single GPU:
+
+- **One model, loaded once — no duplication.** crane-core is a path dependency compiled directly into the binary, not a separate inference server. There is exactly one set of ColQwen3 weights resident in VRAM, shared by ingest and search. No IPC hop, no second copy of the model, no double VRAM budget.
+
+- **Prioritized query lane.** Encode (ingest) and query requests share the single model thread through a priority channel: an interactive search jumps ahead of queued background ingest work, so query latency stays flat even while documents are being processed. Embedding uploads to S3 happen off the hot path in the background.
+
+- **GPU-resident, pre-stacked score cache.** Scoring in `crane` is split into `stack_passages` (build the passage tensor) + `score_stacked` (MaxSim). Hot documents keep their **already-stacked tensor on the GPU**, so a repeat search skips the CPU→GPU upload and the re-stacking entirely and goes straight to the matmul. Score concurrency is bounded by a semaphore to avoid VRAM blowups under bursts.
+
+- **BF16 end-to-end.** Encode, storage, and scoring are all BF16 — half the VRAM and storage of FP32 with no measurable ranking loss, and faster matmuls on Ampere/Ada.
+
+- **Zero-copy search path & warm metadata.** Search reads embeddings without redundant copies, and document metadata is warmed into cache at ingest time so a burst of searches reads warm metadata instead of stampeding Postgres.
+
+- **Parallel, resilient I/O.** Page images download in parallel ranges with bounded retries; the model thread never blocks on network.
+
+- **Encode is compute-bound.** On a 4090 the encode stage is dominated by the vision-model forward pass, not I/O or batching overhead — the levers that actually move it are FP8 weights, fewer tokens per page, or more/faster GPUs, not larger batches.
+
+Set `CRANE_PROFILE=1` to log per-stage timings (download / decode / encode / score) and the processing node id for each document.
 
 ## Quick Start
 
