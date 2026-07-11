@@ -23,3 +23,6 @@
 .DS_Store
 Thumbs.db
 /regression/
+
+# Local model checkpoint (35GB)
+/argus-colqwen35-9b/

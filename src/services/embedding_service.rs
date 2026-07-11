@@ -188,8 +188,8 @@ impl EmbeddingService {
         std::thread::Builder::new()
             .name("embedding-model".into())
             .spawn(move || {
-                info!("Loading ColQwen3 embedding model from: {}", path);
-                let mut model = match crane_core::models::colqwen3_emb::ColQwen3Emb::from_local(
+                info!("Loading embedding model from: {}", path);
+                let mut model = match crane_core::models::col_embedder::ColEmbedder::from_local(
                     &path, use_cpu, use_bf16,
                 ) {
                     Ok(m) => m,
@@ -198,6 +198,7 @@ impl EmbeddingService {
                         return;
                     }
                 };
+                info!("Embedding model kind: {}", model.model_kind());
                 if let Some(dims) = target_dims {
                     model.set_dims(dims);
                     info!("Embedding dims set to {}", dims);
@@ -415,7 +416,7 @@ fn tensor_to_page_embedding(t: &Tensor) -> Result<PageEmbedding> {
 }
 
 fn encode_images_from_bytes(
-    model: &mut crane_core::models::colqwen3_emb::ColQwen3Emb,
+    model: &mut crane_core::models::col_embedder::ColEmbedder,
     images: &[Vec<u8>],
     image_batch: usize,
 ) -> Result<Vec<PageEmbedding>> {
@@ -444,7 +445,7 @@ fn encode_images_from_bytes(
 }
 
 fn encode_query(
-    model: &mut crane_core::models::colqwen3_emb::ColQwen3Emb,
+    model: &mut crane_core::models::col_embedder::ColEmbedder,
     query: &str,
 ) -> Result<Vec<PageEmbedding>> {
     let tensors = model.encode_queries(&[query])?;
@@ -473,7 +474,7 @@ fn build_stacked(
         .iter()
         .map(|e| page_embedding_to_tensor(e, device))
         .collect::<Result<_>>()?;
-    let ps_t = crane_core::models::colqwen3_emb::ColQwen3Emb::stack_passages(&pages)?;
+    let ps_t = crane_core::models::col_embedder::ColEmbedder::stack_passages(&pages)?;
     drop(pages);
     if let Some(c) = gpu_cache {
         // f32 on device: 4 bytes per element, padded size.
@@ -494,7 +495,7 @@ fn score_stacked_on_device(
         .map(|e| page_embedding_to_tensor(e, device))
         .collect::<Result<_>>()?;
 
-    let scores = crane_core::models::colqwen3_emb::ColQwen3Emb::score_stacked(&qs, ps_t, 128)?;
+    let scores = crane_core::models::col_embedder::ColEmbedder::score_stacked(&qs, ps_t, 128)?;
     let scores_vec: Vec<f32> = scores.squeeze(0)?.to_vec1()?;
 
     let mut indexed: Vec<(usize, f32)> = scores_vec.iter().copied().enumerate().collect();
