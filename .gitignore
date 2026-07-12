@@ -26,3 +26,4 @@ Thumbs.db
 
 # Local model checkpoint (35GB)
 /argus-colqwen35-9b/
+vultron-colqwen35-8b/
