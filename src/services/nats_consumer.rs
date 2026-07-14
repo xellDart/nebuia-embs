@@ -98,8 +98,12 @@ pub async fn run_nats_consumer(state: Arc<AppState>) -> Result<()> {
         let msg = match messages.next().await {
             Some(Ok(m)) => m,
             Some(Err(e)) => {
-                warn!("NATS message error: {}", e);
+                // Transient JetStream errors (e.g. 503 no-responders during a server
+                // reconnect/leader change) land here; back off so we don't busy-loop
+                // hammering the server if the condition persists.
+                warn!("NATS message error: {}, backing off...", e);
                 drop(permit);
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
             None => {
