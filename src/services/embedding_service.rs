@@ -139,14 +139,28 @@ pub struct EmbeddingService {
     /// never waits behind multi-second document encodes.
     query_tx: mpsc::Sender<QueryRequest>,
     /// Device handle used by score() on a separate (blocking) task.
-    /// Same physical GPU as the model; CUDA driver schedules concurrent kernels.
+    /// Same physical GPU as the model — see `gpu_lock`.
     device: Arc<Device>,
     /// Caps concurrent score() calls. Each search holds its page tensors on
     /// the GPU while scoring; unbounded concurrency OOMs the device (seen in
     /// prod: 4 simultaneous searches on a 224-page document).
     score_semaphore: Arc<Semaphore>,
+    /// Serializes ALL GPU work between the model thread (encode) and the score
+    /// tasks. The model thread and score() use two separate candle `Device`
+    /// instances on the SAME physical GPU; running kernels from both at once
+    /// corrupts the shared CUDA context/allocator and silently poisons encodes
+    /// with NaN (whole documents came back all-NaN in prod). Encode takes the
+    /// lock per image and score takes it per call, so a search waits at most one
+    /// image (~1s), not a full document encode.
+    gpu_lock: Arc<std::sync::Mutex<()>>,
     /// VRAM-resident page tensors per document (None = disabled).
     gpu_cache: Option<Arc<Mutex<GpuDocCache>>>,
+}
+
+/// Lock the GPU serialization mutex, recovering from a poisoned lock (a prior
+/// panic while encoding must not permanently brick scoring).
+fn gpu_guard(lock: &std::sync::Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    lock.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl EmbeddingService {
@@ -181,6 +195,10 @@ impl EmbeddingService {
         let (query_tx, mut query_rx) = mpsc::channel::<QueryRequest>(64);
         let path = model_path.to_string();
         let image_batch = image_batch.max(1);
+
+        // Serializes GPU work between this thread and score() (see field docs).
+        let gpu_lock = Arc::new(std::sync::Mutex::new(()));
+        let gpu_lock_model = gpu_lock.clone();
 
         // Handle used only to await the two channels from the model thread.
         let rt = tokio::runtime::Handle::current();
@@ -226,11 +244,13 @@ impl EmbeddingService {
                     });
                     match req {
                         Some(Req::Query(QueryRequest { query, reply })) => {
-                            let result = encode_query(&mut model, &query);
+                            let result = encode_query(&mut model, &query, &gpu_lock_model);
                             let _ = reply.send(result);
                         }
                         Some(Req::Images(ImagesRequest { images, reply })) => {
-                            let result = encode_images_from_bytes(&mut model, &images, image_batch);
+                            let result = encode_images_from_bytes(
+                                &mut model, &images, image_batch, &gpu_lock_model,
+                            );
                             let _ = reply.send(result);
                         }
                         None => break,
@@ -256,6 +276,7 @@ impl EmbeddingService {
             query_tx,
             device,
             score_semaphore: Arc::new(Semaphore::new(score_concurrency.max(1))),
+            gpu_lock,
             gpu_cache,
         })
     }
@@ -309,8 +330,11 @@ impl EmbeddingService {
         let sem_ms = t0.elapsed().as_millis();
         let device = self.device.clone();
         let gpu_cache = self.gpu_cache.clone();
+        let gpu_lock = self.gpu_lock.clone();
         let doc_id = document_id.to_string();
         tokio::task::spawn_blocking(move || {
+            // Serialize all GPU work vs the model thread's encode (see gpu_lock).
+            let _g = gpu_guard(&gpu_lock);
             let cached = gpu_cache.as_ref().and_then(|c| c.lock().unwrap().get(&doc_id));
             let hit = cached.is_some();
             let t_stack = Instant::now();
@@ -359,6 +383,7 @@ impl EmbeddingService {
         // permit so it can't stack on top of concurrent searches.
         let _permit = self.score_semaphore.clone().acquire_owned().await?;
         let device = self.device.clone();
+        let gpu_lock = self.gpu_lock.clone();
         let doc_id = document_id.to_string();
         tokio::task::spawn_blocking(move || {
             // Padded-size estimate BEFORE building: an oversized doc would be
@@ -376,6 +401,8 @@ impl EmbeddingService {
             }
             let t0 = Instant::now();
             let pages = page_embs.len();
+            // Serialize the device upload vs the model thread's encode (gpu_lock).
+            let _g = gpu_guard(&gpu_lock);
             let ps_t = build_stacked(&device, &page_embs, Some(cache.as_ref()), &doc_id)?;
             info!(
                 "GPU cache warm [{}]: {} págs, {} MB, {}ms",
@@ -419,6 +446,7 @@ fn encode_images_from_bytes(
     model: &mut crane_core::models::col_embedder::ColEmbedder,
     images: &[Vec<u8>],
     image_batch: usize,
+    gpu_lock: &std::sync::Mutex<()>,
 ) -> Result<Vec<PageEmbedding>> {
     let profile = std::env::var("CRANE_PROFILE").map(|v| v == "1").unwrap_or(false);
     let mut all = Vec::with_capacity(images.len());
@@ -426,10 +454,22 @@ fn encode_images_from_bytes(
     for chunk in images.chunks(image_batch) {
         let refs: Vec<&[u8]> = chunk.iter().map(|v| v.as_slice()).collect();
         let t0 = std::time::Instant::now();
-        let tensors = model.encode_images_from_bytes(&refs)?;
+        // Hold the GPU lock across the forward AND the device->host readback so
+        // no score() kernel runs concurrently on the shared context. Released
+        // between chunks so a waiting search interleaves (keep image_batch small
+        // to bound search latency). See EmbeddingService::gpu_lock.
+        let page_embs: Vec<PageEmbedding> = {
+            let _g = gpu_guard(gpu_lock);
+            let tensors = model.encode_images_from_bytes(&refs)?;
+            tensors
+                .iter()
+                .map(tensor_to_page_embedding)
+                .collect::<Result<Vec<_>>>()?
+        };
         let t1 = std::time::Instant::now();
-        for t in &tensors {
-            all.push(tensor_to_page_embedding(t)?);
+        for pe in page_embs {
+            ensure_finite(&pe)?;
+            all.push(pe);
         }
         t_model += t1.duration_since(t0).as_secs_f64();
         t_convert += t1.elapsed().as_secs_f64();
@@ -447,9 +487,35 @@ fn encode_images_from_bytes(
 fn encode_query(
     model: &mut crane_core::models::col_embedder::ColEmbedder,
     query: &str,
+    gpu_lock: &std::sync::Mutex<()>,
 ) -> Result<Vec<PageEmbedding>> {
-    let tensors = model.encode_queries(&[query])?;
-    tensors.iter().map(tensor_to_page_embedding).collect()
+    let page_embs: Vec<PageEmbedding> = {
+        let _g = gpu_guard(gpu_lock);
+        let tensors = model.encode_queries(&[query])?;
+        tensors
+            .iter()
+            .map(tensor_to_page_embedding)
+            .collect::<Result<Vec<_>>>()?
+    };
+    for pe in &page_embs {
+        ensure_finite(pe)?;
+    }
+    Ok(page_embs)
+}
+
+/// Reject a page embedding that contains NaN/inf. Concurrent GPU use used to
+/// corrupt encodes into all-NaN tensors that then scored as -inf and silently
+/// returned the first pages for every query; failing here makes the ingest
+/// retry instead of persisting garbage.
+fn ensure_finite(pe: &PageEmbedding) -> Result<()> {
+    if pe.data.iter().any(|x| !x.is_finite()) {
+        anyhow::bail!(
+            "non-finite embedding produced (seq_len={}, dims={}); rejecting so the ingest retries",
+            pe.seq_len,
+            pe.dims
+        );
+    }
+    Ok(())
 }
 
 // ── Score function (runs on tokio blocking pool, no model dependency) ──
@@ -618,5 +684,109 @@ mod tests {
         };
         let raw = serialize_embeddings(&[page]);
         assert!(deserialize_embeddings(&raw[..raw.len() - 3]).is_err());
+    }
+}
+
+/// Concurrency validation for the GPU-serialization fix. Ignored by default
+/// (needs the model + GPU + local page images). Run explicitly with:
+///   VAL_MODEL=/path/to/vultron VAL_IMGS=/dir/of/page_N.jpeg \
+///   cargo test --release --features flash-attn -- --ignored --nocapture concurrent_encode_score_stays_finite
+#[cfg(test)]
+mod concurrency_validation {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    fn load_imgs(dir: &str) -> Vec<Vec<u8>> {
+        let mut nums: Vec<(u32, std::path::PathBuf)> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "jpeg" || x == "jpg").unwrap_or(false))
+            .map(|p| {
+                let stem = p.file_stem().unwrap().to_string_lossy().to_string();
+                let n = stem.rsplit('_').next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                (n, p)
+            })
+            .collect();
+        nums.sort_by_key(|(n, _)| *n);
+        nums.iter().map(|(_, p)| std::fs::read(p).unwrap()).collect()
+    }
+
+    fn all_finite(pages: &[PageEmbedding]) -> Option<(usize, usize)> {
+        for (i, pe) in pages.iter().enumerate() {
+            let bad = pe.data.iter().filter(|x| !x.is_finite()).count();
+            if bad > 0 {
+                return Some((i + 1, bad));
+            }
+        }
+        None
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    #[ignore]
+    async fn concurrent_encode_score_stays_finite() {
+        let model = std::env::var("VAL_MODEL").expect("VAL_MODEL");
+        let dir = std::env::var("VAL_IMGS").expect("VAL_IMGS");
+        let iters: usize = std::env::var("VAL_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
+
+        let svc = EmbeddingService::spawn(&model, false, true, Some(320), 8, 40, 2, 2048, 300)
+            .expect("spawn service");
+        let imgs = load_imgs(&dir);
+        eprintln!("[val] {} pages, {} iters, model={}", imgs.len(), iters, model);
+
+        // Seed a "stored" page set to search against, then fire a concurrent
+        // search storm (this is the encode-vs-score concurrency that poisoned prod).
+        let seed = svc.encode_images_from_bytes(imgs.clone()).await.expect("seed encode");
+        assert!(all_finite(&seed).is_none(), "seed encode already non-finite");
+        let stored = Arc::new(seed);
+        let q_seed = svc.encode_query("accionistas".into()).await.expect("seed query");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let searches = Arc::new(AtomicUsize::new(0));
+        let mut searchers = Vec::new();
+        for s in 0..4 {
+            let svc = svc.clone();
+            let stop = stop.clone();
+            let searches = searches.clone();
+            let stored = stored.clone();
+            let q = q_seed.clone();
+            searchers.push(tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = svc
+                        .score(&format!("val-doc-{s}"), q.clone(), stored.clone())
+                        .await;
+                    searches.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        // Meanwhile hammer encode (ingest) and assert every encode is finite.
+        let mut poisoned = 0;
+        for it in 0..iters {
+            let q = svc.encode_query("aumentos de capital".into()).await.expect("q");
+            if let Some((p, n)) = all_finite(&q) {
+                poisoned += 1;
+                eprintln!("[val] iter {it}: QUERY non-finite page {p} ({n})");
+            }
+            let pages = svc.encode_images_from_bytes(imgs.clone()).await.expect("enc");
+            match all_finite(&pages) {
+                None => eprintln!("[val] iter {it}: clean ({} pages)", pages.len()),
+                Some((p, n)) => {
+                    poisoned += 1;
+                    eprintln!("[val] iter {it}: POISONED page {p} nonfinite={n}");
+                }
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for h in searchers {
+            let _ = h.await;
+        }
+        eprintln!(
+            "[val] RESULT: {}/{} encodes poisoned, {} concurrent searches ran",
+            poisoned,
+            iters,
+            searches.load(Ordering::Relaxed)
+        );
+        assert_eq!(poisoned, 0, "encodes were poisoned under concurrent search load");
     }
 }
