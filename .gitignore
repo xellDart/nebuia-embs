@@ -27,3 +27,7 @@ Thumbs.db
 # Local model checkpoint (35GB)
 /argus-colqwen35-9b/
 vultron-colqwen35-8b/
+
+# Cargo lockfile — regenerated per-build; tracking it dirties the tree and
+# breaks install.sh git merge --ff-only across machines.
+/Cargo.lock
